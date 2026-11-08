@@ -5,6 +5,8 @@ const stdx = @import("stdx");
 
 const zml = @import("../../../zml.zig");
 const Tensor = zml.Tensor;
+const Activation = @import("../options.zig").Activation;
+const GlobalOptions = @import("../options.zig").Options;
 pub const gmm_ep = @import("gmm_ep.zig");
 
 const log = std.log.scoped(.@"zml/moe/mosaic_tpu");
@@ -13,7 +15,7 @@ var gate_up_transpose: std.atomic.Value(bool) = .init(false);
 var down_transpose: std.atomic.Value(bool) = .init(false);
 
 pub const Options = struct {
-    activation: zml.moe.Activation,
+    activation: Activation,
     global_num_experts: i64 = -1,
     expert_map: ?Tensor = null,
     w1_scale: ?Tensor = null,
@@ -22,7 +24,7 @@ pub const Options = struct {
     w2_bias: ?Tensor = null,
 };
 
-fn validateOptions(opts: zml.moe.Options) void {
+fn validateOptions(opts: GlobalOptions) void {
     stdx.debug.assert(!opts.quantize_input, "Optional FP8 input quantization requires the Triton MoE backend", .{});
     stdx.debug.assert(opts.routing_weight_placement == .after_down, "Non-Triton MoE backends require routing weights after the down projection", .{});
     // TODO(Corentin): find where to put that
@@ -229,7 +231,7 @@ pub fn fusedExperts(
     topk_weights: zml.Tensor,
     gate_up: zml.nn.Linear,
     down: zml.nn.Linear,
-    opts: zml.moe.Options,
+    opts: GlobalOptions,
 ) zml.Tensor {
     validateOptions(opts);
 
@@ -247,7 +249,7 @@ pub fn fusedExperts(
                 topk_weights: zml.Tensor,
                 weights_gate_up: zml.Tensor,
                 weights_down: zml.Tensor,
-                activation: zml.moe.Activation,
+                activation: Activation,
                 global_num_experts: i64,
                 gate_up_scales: ?zml.Tensor,
                 bias_gate_up: ?zml.Tensor,
@@ -384,7 +386,7 @@ pub fn fusedExpertsImpl(
         gate_up_out = gate_up_out.add(bias_per_token);
     }
 
-    const activated = zml.moe.applyActivation(gate_up_out, opts.activation, .concatenated);
+    const activated = opts.activation.applyActivation(gate_up_out, .concatenated);
 
     const aligned_activated = alignSortedRowsByGroup(activated, expert_ids_sorted, group_sizes, tile_m);
     var down_out = callGmmEp(aligned_activated.rows, down, aligned_activated.group_sizes, hidden.dtype(), .none)

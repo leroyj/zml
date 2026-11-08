@@ -3,6 +3,8 @@
 const stdx = @import("stdx");
 
 const zml = @import("../../../zml.zig");
+const Options = @import("../options.zig").Options;
+const RoutingWeightPlacement = @import("../options.zig").RoutingWeightPlacement;
 pub const kernels = @import("sm10x/moe.zig");
 
 // `moe.zig`'s `refAllDecls` reaches this file but not its imports, so the
@@ -24,7 +26,7 @@ pub fn isNvfp4Supported(platform: *const zml.Platform) bool {
     return cc.major == 10 and cc.minor == 3;
 }
 
-pub fn validateOptions(opts: zml.moe.Options) void {
+pub fn validateOptions(opts: Options) void {
     stdx.debug.assert(opts.activation == .swiglu, "cute backend only accepts swiglu activation, got {}", .{opts.activation});
     stdx.debug.assert(opts.activation.swiglu.bias == null, "cute backend requires swiglu bias to be null", .{});
     stdx.debug.assert(opts.activation.swiglu.scale == null, "cute backend requires swiglu scale to be null", .{});
@@ -42,7 +44,7 @@ pub fn fusedExperts(
     weights: zml.Tensor,
     gate_up: zml.nn.Linear,
     down: zml.nn.Linear,
-    options: zml.moe.Options,
+    options: Options,
 ) zml.Tensor {
     validateOptions(options);
     stdx.debug.assert(input.dtype() == .bf16, "cute backend only supports bf16 inputs, got {}", .{input.dtype()});
@@ -126,7 +128,7 @@ const Context = struct {
     s2: zml.Tensor,
     topk: i64,
     swiglu_limit: ?f32,
-    routing_weight_placement: zml.moe.RoutingWeightPlacement,
+    routing_weight_placement: RoutingWeightPlacement,
     format: Format,
     expert_parallel: bool,
 

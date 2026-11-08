@@ -6,9 +6,12 @@ const zml = @import("../../../zml.zig");
 const Tensor = zml.Tensor;
 const Shape = zml.Shape;
 const DataType = zml.DataType;
+const ExpertsLayout = @import("../options.zig").ExpertsLayout;
+const ProjectionLayout = @import("../options.zig").ProjectionLayout;
+const RoutingWeightPlacement = @import("../options.zig").RoutingWeightPlacement;
+const Activation = @import("../options.zig").Activation;
+const Options = @import("../options.zig").Options;
 const fly = @import("moe.zig");
-const ProjectionLayout = zml.moe.ProjectionLayout;
-const RoutingWeightPlacement = zml.moe.RoutingWeightPlacement;
 
 const log = std.log.scoped(.@"zml/moe/fused_experts");
 
@@ -22,10 +25,10 @@ pub fn fusedExperts(
     topk_weights: zml.Tensor,
     gate_up: zml.nn.Linear,
     down: zml.nn.Linear,
-    opts: zml.moe.Options,
+    opts: Options,
 ) zml.Tensor {
     const gate_up_scheme: ?zml.Quantization.Scheme = if (gate_up.quantization) |q| q.scheme else null;
-    const layout: zml.moe.ExpertsLayout = if (gate_up_scheme == .mxfp4)
+    const layout: ExpertsLayout = if (gate_up_scheme == .mxfp4)
         .{ .gate_up = .interleaved, .packing = .plain }
     else
         .{ .gate_up = .concatenated, .packing = .plain };
@@ -84,7 +87,7 @@ pub const FusedExpertsArgs = struct {
     down: zml.nn.Linear,
     topk_weights: Tensor,
     topk_ids: Tensor,
-    activation: zml.moe.Activation,
+    activation: Activation,
     expert_map: ?Tensor = null,
     /// Use FP8 activations for FP8 weights; false keeps BF16 activations.
     quantize_input: bool,
@@ -175,7 +178,7 @@ pub fn fusedExpertsImpl(opts: FusedExpertsArgs) Tensor {
         .output_shape = Shape.init(.{ .token = routing.num_assignments, .out = gate_up.dim(.out) }, .bf16),
     });
 
-    var activated = zml.moe.applyActivation(gate_up_out, opts.activation, opts.gate_up_layout);
+    var activated = opts.activation.applyActivation(gate_up_out, opts.gate_up_layout);
     if (opts.routing_weight_placement == .before_down) {
         const weights = routing_weights.reshape(.{ .token = routing.num_assignments }).convert(.f32);
         activated = activated.mul(weights.broad(activated.shape()));

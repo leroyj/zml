@@ -1,13 +1,17 @@
 const std = @import("std");
+
 const stdx = @import("stdx");
 
 const zml = @import("../../../zml.zig");
 const Tensor = zml.Tensor;
+const Activation = @import("../options.zig").Activation;
+const GlobalOptions = @import("../options.zig").Options;
+const unpackedWeight = @import("../weights.zig").unpackedWeight;
 
 const log = std.log.scoped(.@"zml/moe/metal");
 
 pub const Options = struct {
-    activation: zml.moe.Activation,
+    activation: Activation,
     global_num_experts: i64 = -1,
     w1_scale: ?Tensor = null,
     w2_scale: ?Tensor = null,
@@ -15,7 +19,7 @@ pub const Options = struct {
     w2_global_scale: ?Tensor = null,
 };
 
-fn validateOptions(opts: zml.moe.Options) void {
+fn validateOptions(opts: GlobalOptions) void {
     stdx.debug.assert(!opts.quantize_input, "Optional FP8 input quantization requires the Triton MoE backend", .{});
     stdx.debug.assert(opts.routing_weight_placement == .after_down, "Non-Triton MoE backends require routing weights after the down projection", .{});
 }
@@ -77,7 +81,7 @@ pub fn fusedExperts(
     topk_weights: zml.Tensor,
     gate_up: zml.nn.Linear,
     down: zml.nn.Linear,
-    opts: zml.moe.Options,
+    opts: GlobalOptions,
 ) zml.Tensor {
     validateOptions(opts);
     stdx.debug.assert(gate_up.bias == null, "metal backend doesn't support gate_up bias", .{});
@@ -89,8 +93,8 @@ pub fn fusedExperts(
     const down_scales: ?zml.Tensor = if (down.quantization) |q| q.scales else null;
     const down_global_scale: ?zml.Tensor = if (down.quantization) |q| (if (q.global_scale) |scale| scale.asMultiplier() else null) else null;
 
-    const gate_up_weight_unpacked = zml.moe.unpackedWeight(gate_up);
-    const down_weight_unpacked = zml.moe.unpackedWeight(down);
+    const gate_up_weight_unpacked = unpackedWeight(gate_up);
+    const down_weight_unpacked = unpackedWeight(down);
 
     return fusedExpertsImpl(
         input,
@@ -174,7 +178,7 @@ pub fn fusedExpertsImpl(
         zml.Shape.init(.{ .r = num_routes, .out = gate_up.dim(.dout) }, act_dtype),
         mode,
     ), opts.w1_global_scale, expert_ids);
-    const activated = zml.moe.applyActivation(gate_up_out, opts.activation, .concatenated).convert(act_dtype);
+    const activated = opts.activation.applyActivation(gate_up_out, .concatenated).convert(act_dtype);
 
     const down_out = applyDownGlobalScale(moeGemm(
         activated,

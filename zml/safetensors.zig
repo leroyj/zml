@@ -77,7 +77,13 @@ pub const TensorRegistry = struct {
             },
             .unknown => {
                 // the path is possibly a folder, let's try that
-                return try fromRepo(allocator, io, path);
+                const repo = std.Io.Dir.openDir(.cwd(), io, path, .{}) catch |e| {
+                    return switch (e) {
+                        error.FileNotFound => ModelPathResolutionError.FileNotFound,
+                        else => ModelPathResolutionError.InvalidPath,
+                    };
+                };
+                return try fromRepo(allocator, io, repo);
             },
         }
     }

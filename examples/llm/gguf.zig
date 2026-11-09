@@ -246,6 +246,22 @@ pub const Context = struct {
             const rows: usize = if (tensor.dims.len == 1) @intCast(tensor.dims[0]) else @intCast(tensor.dims[1]);
             const row_len: usize = if (tensor.dims.len == 1) 1 else @intCast(tensor.dims[0]);
 
+            const is_embedding = std.mem.eql(u8, tensor.name, "token_embd.weight");
+            const is_conv1d = std.mem.endsWith(u8, tensor.name, ".ssm_conv1d.weight");
+            const quantize = tensor.dims.len == 2 and !is_embedding and !is_conv1d and
+                tensor.quant.elementsPerBlock() >= 32;
+
+            if (quantize) {
+                const k: i64 = @intCast(tensor.dims[0]);
+                const n: i64 = @intCast(tensor.dims[1]);
+                const dims_q = [_]i64{ n, k };
+                const dims_s = [_]i64{ n, @divExact(k, 32) };
+
+                try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".q8", .q8_quants, &dims_q, .i8, layout, rows, row_len);
+                try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".s", .q8_scales, &dims_s, .f16, layout, rows, row_len);
+                continue;
+            }
+
             const ctx = try arena_allocator.create(DequantCtx);
             ctx.* = .{
                 .data = self.mapped,
@@ -277,6 +293,52 @@ pub const Context = struct {
         }
 
         return result;
+    }
+
+    fn registerQuantized(
+        self: *Context,
+        result: *zml.safetensors.TensorRegistry,
+        arena: std.mem.Allocator,
+        tensor: TensorInfo,
+        hf_name: []const u8,
+        suffix: []const u8,
+        output: Output,
+        dims: []const i64,
+        dtype: zml.DataType,
+        layout: Layout,
+        rows: usize,
+        row_len: usize,
+    ) !void {
+        const name = try std.fmt.allocPrint(arena, "{s}{s}", .{ hf_name, suffix });
+        const ctx = try arena.create(DequantCtx);
+        ctx.* = .{
+            .data = self.mapped,
+            .quant = tensor.quant,
+            .offset = @intCast(self.data_offset + tensor.offset),
+            .numel = @intCast(tensor.numel),
+            .rows = rows,
+            .row_len = row_len,
+            .permute = layout.permute,
+            .perm_offset = layout.perm_offset,
+            .head_dim = layout.head_dim,
+            .num_k_heads = self.num_k_heads,
+            .num_v_per_k = self.num_v_per_k,
+            .transform = layout.transform,
+            .output = output,
+        };
+
+        try result.registerTensor(.{
+            .file_uri = self.file_uri,
+            .name = name,
+            .shape = .init(dims, dtype),
+            .offset = self.data_offset + tensor.offset,
+            .custom = .{
+                .ctx = ctx,
+                .start = DequantCtx.start,
+                .fill = DequantCtx.fill,
+                .stop = DequantCtx.stop,
+            },
+        });
     }
 
     fn layoutFor(self: *const Context, name: []const u8) Layout {
@@ -800,6 +862,8 @@ const Layout = struct {
     transform: Transform = .none,
 };
 
+const Output = enum { bf16, q8_quants, q8_scales };
+
 const DequantCtx = struct {
     data: []const u8,
     quant: quants.Quant,
@@ -813,6 +877,7 @@ const DequantCtx = struct {
     num_k_heads: usize,
     num_v_per_k: usize,
     transform: Transform,
+    output: Output = .bf16,
 
     const ReadState = struct {
         ctx: *const DequantCtx,
@@ -822,6 +887,7 @@ const DequantCtx = struct {
         out: []u8,
         out_len: usize,
         out_pos: usize,
+        f32_row: []f32,
         f32_buffer: [256]f32,
     };
 
@@ -834,13 +900,17 @@ const DequantCtx = struct {
         const state = try allocator.create(ReadState);
         errdefer allocator.destroy(state);
 
-        const out_len: usize = if (self.permute == .none)
-            chunk_elements * 2
-        else
-            self.row_len * 2;
+        const out_len: usize = switch (self.output) {
+            .bf16 => if (self.permute == .none) chunk_elements * 2 else self.row_len * 2,
+            .q8_quants => if (self.permute == .none) chunk_elements else self.row_len,
+            .q8_scales => if (self.permute == .none) chunk_elements / 32 * 2 else self.row_len / 32 * 2,
+        };
 
         const out = try allocator.alloc(u8, out_len);
         errdefer allocator.free(out);
+
+        const f32_row = try allocator.alloc(f32, if (self.output != .bf16 and self.permute != .none) self.row_len else 0);
+        errdefer allocator.free(f32_row);
 
         state.* = .{
             .ctx = self,
@@ -850,6 +920,7 @@ const DequantCtx = struct {
             .out = out,
             .out_len = 0,
             .out_pos = 0,
+            .f32_row = f32_row,
             .f32_buffer = undefined,
         };
         return state;
@@ -858,6 +929,7 @@ const DequantCtx = struct {
     fn stop(state: *anyopaque, io: std.Io) void {
         _ = io;
         const self: *ReadState = @ptrCast(@alignCast(state));
+        std.heap.page_allocator.free(self.f32_row);
         std.heap.page_allocator.free(self.out);
         std.heap.page_allocator.destroy(self);
     }
@@ -915,11 +987,36 @@ const DequantCtx = struct {
                 for (0..n_blocks) |block_index| {
                     const block = src[block_index * comptime_block_size ..][0..comptime_block_size];
                     quants.dequantBlockKind(q, block, self.f32_buffer[0..comptime_epb]);
-                    for (self.f32_buffer[0..comptime_epb]) |value| {
-                        const bits = f32ToBf16(applyTransform(ctx.transform, value));
-                        self.out[out_off + 0] = @truncate(bits);
-                        self.out[out_off + 1] = @truncate(bits >> 8);
-                        out_off += 2;
+                    switch (ctx.output) {
+                        .bf16 => {
+                            for (self.f32_buffer[0..comptime_epb]) |value| {
+                                const bits = f32ToBf16(applyTransform(ctx.transform, value));
+                                self.out[out_off + 0] = @truncate(bits);
+                                self.out[out_off + 1] = @truncate(bits >> 8);
+                                out_off += 2;
+                            }
+                        },
+                        .q8_quants, .q8_scales => {
+                            var sub: usize = 0;
+                            while (sub < comptime_epb) : (sub += 32) {
+                                var transformed: [32]f32 = undefined;
+                                for (self.f32_buffer[sub..][0..32], 0..) |value, j| {
+                                    transformed[j] = applyTransform(ctx.transform, value);
+                                }
+                                const scale = q8Scale(&transformed);
+                                if (ctx.output == .q8_quants) {
+                                    for (transformed, 0..) |value, j| {
+                                        self.out[out_off + j] = @bitCast(q8Quant(value, scale));
+                                    }
+                                    out_off += 32;
+                                } else {
+                                    const bits: u16 = @bitCast(@as(f16, @floatCast(scale)));
+                                    self.out[out_off + 0] = @truncate(bits);
+                                    self.out[out_off + 1] = @truncate(bits >> 8);
+                                    out_off += 2;
+                                }
+                            }
+                        },
                     }
                 }
             },
@@ -944,33 +1041,89 @@ const DequantCtx = struct {
         if (src_offset + src_len > ctx.data.len) return error.UnexpectedEndOfFile;
         const src = ctx.data[src_offset..][0..src_len];
 
-        var col: usize = 0;
-        switch (ctx.quant) {
-            inline else => |q| {
-                const comptime_block_size = comptime q.blockSize();
-                const comptime_epb = comptime q.elementsPerBlock();
-                for (0..blocks_per_row) |block_index| {
-                    const block = src[block_index * comptime_block_size ..][0..comptime_block_size];
-                    quants.dequantBlockKind(q, block, self.f32_buffer[0..comptime_epb]);
-                    for (self.f32_buffer[0..comptime_epb]) |value| {
-                        const bits = f32ToBf16(applyTransform(ctx.transform, value));
-                        const out_col = switch (ctx.permute) {
-                            .column => inverseFlat(ctx, col),
-                            else => col,
-                        };
-                        self.out[out_col * 2 + 0] = @truncate(bits);
-                        self.out[out_col * 2 + 1] = @truncate(bits >> 8);
-                        col += 1;
+        switch (ctx.output) {
+            .bf16 => {
+                var col: usize = 0;
+                switch (ctx.quant) {
+                    inline else => |q| {
+                        const comptime_block_size = comptime q.blockSize();
+                        const comptime_epb = comptime q.elementsPerBlock();
+                        for (0..blocks_per_row) |block_index| {
+                            const block = src[block_index * comptime_block_size ..][0..comptime_block_size];
+                            quants.dequantBlockKind(q, block, self.f32_buffer[0..comptime_epb]);
+                            for (self.f32_buffer[0..comptime_epb]) |value| {
+                                const bits = f32ToBf16(applyTransform(ctx.transform, value));
+                                const out_col = switch (ctx.permute) {
+                                    .column => inverseFlat(ctx, col),
+                                    else => col,
+                                };
+                                self.out[out_col * 2 + 0] = @truncate(bits);
+                                self.out[out_col * 2 + 1] = @truncate(bits >> 8);
+                                col += 1;
+                            }
+                        }
+                    },
+                }
+                self.out_len = ctx.row_len * 2;
+            },
+            .q8_quants, .q8_scales => {
+                var col: usize = 0;
+                switch (ctx.quant) {
+                    inline else => |q| {
+                        const comptime_block_size = comptime q.blockSize();
+                        const comptime_epb = comptime q.elementsPerBlock();
+                        for (0..blocks_per_row) |block_index| {
+                            const block = src[block_index * comptime_block_size ..][0..comptime_block_size];
+                            quants.dequantBlockKind(q, block, self.f32_buffer[0..comptime_epb]);
+                            for (self.f32_buffer[0..comptime_epb]) |value| {
+                                const out_col = switch (ctx.permute) {
+                                    .column => inverseFlat(ctx, col),
+                                    else => col,
+                                };
+                                self.f32_row[out_col] = applyTransform(ctx.transform, value);
+                                col += 1;
+                            }
+                        }
+                    },
+                }
+
+                var out_off: usize = 0;
+                var i: usize = 0;
+                while (i < ctx.row_len) : (i += 32) {
+                    const values = self.f32_row[i..][0..32];
+                    const scale = q8Scale(values);
+                    if (ctx.output == .q8_quants) {
+                        for (values, 0..) |value, j| {
+                            self.out[out_off + j] = @bitCast(q8Quant(value, scale));
+                        }
+                        out_off += 32;
+                    } else {
+                        const bits: u16 = @bitCast(@as(f16, @floatCast(scale)));
+                        self.out[out_off + 0] = @truncate(bits);
+                        self.out[out_off + 1] = @truncate(bits >> 8);
+                        out_off += 2;
                     }
                 }
+                self.out_len = out_off;
             },
         }
 
         self.out_row += 1;
-        self.out_len = ctx.row_len * 2;
         self.out_pos = 0;
     }
 };
+
+fn q8Scale(values: []const f32) f32 {
+    var max_abs: f32 = 0.0;
+    for (values) |value| max_abs = @max(max_abs, @abs(value));
+    return max_abs / 127.0;
+}
+
+fn q8Quant(value: f32, scale: f32) i8 {
+    if (scale == 0.0) return 0;
+    const q = @round(value / scale);
+    return @intFromFloat(std.math.clamp(q, -127.0, 127.0));
+}
 
 fn applyTransform(transform: Transform, value: f32) f32 {
     return switch (transform) {

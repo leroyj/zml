@@ -5,6 +5,7 @@ const stdx = zml.stdx;
 
 const common = @import("../common.zig");
 const inference = @import("inference.zig");
+const q8_triton = @import("../../gguf/q8_triton.zig");
 
 const log = std.log.scoped(.qwen3_5);
 
@@ -109,7 +110,7 @@ pub const LoadedModel = struct {
     pub fn unloadBuffers(self: *const LoadedModel, buffers: *Buffers, allocator: std.mem.Allocator) void {
         _ = self;
         TextModel.unloadBuffers(&buffers.text_model, allocator);
-        zml.nn.Linear.unloadBuffers(&buffers.lm_head);
+        LinearLike.unloadBuffers(&buffers.lm_head);
     }
 
     pub fn compile(
@@ -140,7 +141,7 @@ pub const Model = struct {
     };
 
     text_model: TextModel,
-    lm_head: zml.nn.Linear,
+    lm_head: LinearLike,
 
     config: Config,
     gen_options: GenOptions,
@@ -158,9 +159,14 @@ pub const Model = struct {
         };
         return .{
             .text_model = try .init(allocator, store.withPrefix("model.language_model"), config),
-            .lm_head = .init(
-                store.withPrefix(lm_head_prefix).createTensor("weight", .{ .dout, .d }, .model, .{ .dout = .model, .d = .replicated }),
-                null,
+            .lm_head = LinearLike.init(
+                store.withPrefix(lm_head_prefix),
+                .{ .dout, .d },
+                .model,
+                .{ .dout = .model, .d = .replicated },
+                .{.dout},
+                .model,
+                .{ .dout = .replicated },
                 .d,
             ),
             .config = config,
@@ -207,7 +213,7 @@ pub const Model = struct {
 
     pub fn unloadBuffers(self: *zml.Bufferized(Model), allocator: std.mem.Allocator) void {
         TextModel.unloadBuffers(&self.text_model, allocator);
-        zml.nn.Linear.unloadBuffers(&self.lm_head);
+        LinearLike.unloadBuffers(&self.lm_head);
     }
     pub fn forward(
         self: Model,
@@ -241,7 +247,7 @@ pub const Model = struct {
 
 pub const Sampler = struct {
     norm: RmsNorm,
-    lm_head: zml.nn.Linear,
+    lm_head: LinearLike,
     gen_options: Model.GenOptions,
 
     pub const Input = struct {
@@ -497,33 +503,229 @@ pub const TransformerLayer = struct {
     }
 };
 
+pub const QuantizedLinear = struct {
+    quants: zml.Tensor,
+    scales: zml.Tensor,
+    bias: ?zml.Tensor,
+    contraction_tag: zml.Shape.Tag,
+    output_tag: zml.Shape.Tag,
+    block_n: i64,
+
+    pub fn init(
+        store: zml.io.TensorStore.View,
+        tags: anytype,
+        mesh_: @EnumLiteral(),
+        partitioning: anytype,
+        bias_tags: anytype,
+        bias_mesh: @EnumLiteral(),
+        bias_partitioning: anytype,
+        comptime contraction_tag: anytype,
+    ) QuantizedLinear {
+        _ = tags;
+        const contraction: zml.Shape.Tag = zml.Shape.toTag(contraction_tag);
+        const is_d = comptime std.mem.eql(u8, @tagName(contraction_tag), "d");
+        const output: zml.Shape.Tag = if (is_d) zml.Shape.toTag(.dout) else zml.Shape.toTag(.d);
+        const output_partition = if (is_d) partitioning.dout else partitioning.d;
+        const contraction_partition = if (is_d) partitioning.d else partitioning.dout;
+
+        const quants = store.createTensor("weight.q8", .{ .n, .k }, mesh_, .{ .n = output_partition, .k = contraction_partition });
+        const dout = quants.dim(.n);
+        return .{
+            .quants = quants,
+            .scales = store.createTensor("weight.s", .{ .n, .k32 }, mesh_, .{ .n = output_partition, .k32 = .replicated }),
+            .bias = store.maybeCreateTensor("bias", bias_tags, bias_mesh, bias_partitioning),
+            .contraction_tag = contraction,
+            .output_tag = output,
+            .block_n = if (dout >= 64) 64 else 16,
+        };
+    }
+
+    pub fn forward(self: QuantizedLinear, x: zml.Tensor, dtype: zml.DataType) zml.Tensor {
+        _ = dtype;
+        const x_shape = x.shape();
+        const d = x.dim(self.contraction_tag);
+        const m: i64 = @divExact(@as(i64, @intCast(x_shape.count())), d);
+        const x_flat = x.reshape(zml.Shape.init(.{ .m = m, .k = d }, x.dtype()));
+
+        const use_kernel = switch (zml.Compiler.current().platform.target) {
+            .rocm, .cuda => true,
+            else => false,
+        };
+
+        const out_padded = if (!use_kernel) blk: {
+            const n = self.quants.dim(.n);
+            const nb = @divExact(d, 32);
+            const q = self.quants.reshape(zml.Shape.init(.{ .n = n, .nb = nb, .block = 32 }, .i8)).convert(.f32);
+            const s = self.scales.reshape(zml.Shape.init(.{ .n = n, .nb = nb, .one = 1 }, .f16)).convert(.f32);
+            const w = q.mul(s.broad(q.shape())).reshape(zml.Shape.init(.{ .n = n, .k = d }, .f32)).convert(.bf16);
+            break :blk x_flat.dot(w, .k);
+        } else if (m == 1) blk: {
+            const x_row = x_flat.reshape(zml.Shape.init(.{ .k = d }, x.dtype()));
+            const out_row = q8Matvec1(x_row, self.quants, self.scales, self.block_n);
+            break :blk out_row.reshape(zml.Shape.init(.{ .m = 1, .n = self.quants.dim(.n) }, .bf16));
+        } else blk: {
+            const m_padded = std.mem.alignForward(i64, m, 16);
+            const x_padded = if (m_padded == m) x_flat else blk2: {
+                const zeros = zml.Tensor.scalar(0, x.dtype()).broad(zml.Shape.init(.{ .m = m_padded - m, .k = d }, x.dtype()));
+                break :blk2 zml.Tensor.concatenate(&.{ x_flat, zeros }, .m);
+            };
+            break :blk q8Matvec(x_padded, self.quants, self.scales, self.block_n);
+        };
+
+        const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
+        const out_shape = x_shape.setDim(self.contraction_tag, self.quants.dim(.n));
+        var out = out_flat.reshape(out_shape).renameTag(self.contraction_tag, self.output_tag);
+        if (self.bias) |bias| out = out.add(bias.broad(out.shape()));
+        return out;
+    }
+};
+
+fn q8Matvec(x: zml.Tensor, quants: zml.Tensor, scales: zml.Tensor, block_n: i64) zml.Tensor {
+    const m = x.dim(.m);
+    const k = x.dim(.k);
+    const n = quants.dim(.n);
+    const cfg: q8_triton.Config = .{
+        .m = m,
+        .n = n,
+        .k = k,
+        .block_m = 16,
+        .block_n = block_n,
+        .block_k = 256,
+        .stride_xm = k,
+        .stride_xk = 1,
+        .stride_qn = k,
+        .stride_qk = 1,
+        .stride_sn = @divExact(k, 32),
+        .stride_sk = 1,
+        .stride_om = n,
+        .stride_on = 1,
+    };
+    return q8_triton.Q8Matvec.call(
+        .{ .x_ptr = x, .q_ptr = quants, .s_ptr = scales },
+        .{ .out = zml.Shape.init(.{ .m = m, .n = n }, .bf16) },
+        .{
+            .cfg = cfg,
+            .grid = .{ @intCast(@divExact(m, 16)), @intCast(@divExact(n, block_n)), 1 },
+            .num_stages = 3,
+            .num_warps = 4,
+        },
+    ).out;
+}
+
+fn q8Matvec1(x: zml.Tensor, quants: zml.Tensor, scales: zml.Tensor, block_n: i64) zml.Tensor {
+    const k = x.dim(.k);
+    const n = quants.dim(.n);
+    const cfg: q8_triton.Config = .{
+        .m = 1,
+        .n = n,
+        .k = k,
+        .block_m = 16,
+        .block_n = block_n,
+        .block_k = 256,
+        .stride_xm = k,
+        .stride_xk = 1,
+        .stride_qn = k,
+        .stride_qk = 1,
+        .stride_sn = @divExact(k, 32),
+        .stride_sk = 1,
+        .stride_om = n,
+        .stride_on = 1,
+    };
+    return q8_triton.Q8Matvec1.call(
+        .{ .x_ptr = x, .q_ptr = quants, .s_ptr = scales },
+        .{ .out = zml.Shape.init(.{ .n = n }, .bf16) },
+        .{
+            .cfg = cfg,
+            .grid = .{ @intCast(@divExact(n, block_n)), 1, 1 },
+            .num_stages = 3,
+            .num_warps = 4,
+        },
+    ).out;
+}
+
+pub const LinearLike = union(enum) {
+    bf16: zml.nn.Linear,
+    q8: QuantizedLinear,
+
+    pub fn init(
+        store: zml.io.TensorStore.View,
+        tags: anytype,
+        mesh_: @EnumLiteral(),
+        partitioning: anytype,
+        bias_tags: anytype,
+        bias_mesh: @EnumLiteral(),
+        bias_partitioning: anytype,
+        comptime contraction_tag: anytype,
+    ) LinearLike {
+        if (store.getShape("weight.q8") != null) {
+            return .{ .q8 = QuantizedLinear.init(store, tags, mesh_, partitioning, bias_tags, bias_mesh, bias_partitioning, contraction_tag) };
+        }
+        return .{ .bf16 = zml.nn.Linear.init(
+            store.createTensor("weight", tags, mesh_, partitioning),
+            store.maybeCreateTensor("bias", bias_tags, bias_mesh, bias_partitioning),
+            contraction_tag,
+        ) };
+    }
+
+    pub fn forward(self: LinearLike, x: zml.Tensor, dtype: zml.DataType) zml.Tensor {
+        return switch (self) {
+            .bf16 => |linear| linear.forward(x, dtype),
+            .q8 => |linear| linear.forward(x, dtype),
+        };
+    }
+
+    pub fn unloadBuffers(self: *zml.Bufferized(LinearLike)) void {
+        switch (self.*) {
+            .bf16 => |*linear| zml.nn.Linear.unloadBuffers(linear),
+            .q8 => |*linear| zml.Buffer.deinitAll(QuantizedLinear, linear),
+        }
+    }
+};
+
 pub const Mlp = struct {
-    up_proj: zml.nn.Linear,
-    gate_proj: zml.nn.Linear,
-    down_proj: zml.nn.Linear,
+    up_proj: LinearLike,
+    gate_proj: LinearLike,
+    down_proj: LinearLike,
 
     pub fn init(store: zml.io.TensorStore.View) Mlp {
         return .{
-            .up_proj = .init(
-                store.withPrefix("up_proj").createTensor("weight", .{ .dout, .d }, .model, .{ .dout = .model, .d = .replicated }),
-                store.withPrefix("up_proj").maybeCreateTensor("bias", .{.dout}, .model, .{ .dout = .model }),
+            .up_proj = LinearLike.init(
+                store.withPrefix("up_proj"),
+                .{ .dout, .d },
+                .model,
+                .{ .dout = .model, .d = .replicated },
+                .{.dout},
+                .model,
+                .{ .dout = .model },
                 .d,
             ),
-            .gate_proj = .init(
-                store.withPrefix("gate_proj").createTensor("weight", .{ .dout, .d }, .model, .{ .dout = .model, .d = .replicated }),
-                store.withPrefix("gate_proj").maybeCreateTensor("bias", .{.dout}, .model, .{ .dout = .model }),
+            .gate_proj = LinearLike.init(
+                store.withPrefix("gate_proj"),
+                .{ .dout, .d },
+                .model,
+                .{ .dout = .model, .d = .replicated },
+                .{.dout},
+                .model,
+                .{ .dout = .model },
                 .d,
             ),
-            .down_proj = .init(
-                store.withPrefix("down_proj").createTensor("weight", .{ .d, .dout }, .model, .{ .d = .replicated, .dout = .model }),
-                store.withPrefix("down_proj").maybeCreateTensor("bias", .{.d}, .model, .{ .d = .replicated }),
+            .down_proj = LinearLike.init(
+                store.withPrefix("down_proj"),
+                .{ .d, .dout },
+                .model,
+                .{ .d = .replicated, .dout = .model },
+                .{.d},
+                .model,
+                .{ .d = .replicated },
                 .dout,
             ),
         };
     }
 
     pub fn unloadBuffers(self: *zml.Bufferized(Mlp)) void {
-        zml.Buffer.deinitAll(Mlp, self);
+        LinearLike.unloadBuffers(&self.up_proj);
+        LinearLike.unloadBuffers(&self.gate_proj);
+        LinearLike.unloadBuffers(&self.down_proj);
     }
 
     pub fn forward(self: Mlp, x: zml.Tensor) zml.Tensor {
@@ -537,9 +739,9 @@ pub const Mlp = struct {
 };
 
 pub const SelfAttn = struct {
-    q_proj: zml.nn.Linear,
-    k_proj: zml.nn.Linear,
-    v_proj: zml.nn.Linear,
+    q_proj: LinearLike,
+    k_proj: LinearLike,
+    v_proj: LinearLike,
 
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -549,12 +751,17 @@ pub const SelfAttn = struct {
     head_dim: i64,
     rotary_dim: i64,
     rotary_embed: TextRotaryEmbedding,
-    o_proj: zml.nn.Linear,
+    o_proj: LinearLike,
 
-    fn initProj(store: zml.io.TensorStore.View, partitions: anytype, bias_partitions: anytype) zml.nn.Linear {
-        return .init(
-            store.createTensor("weight", .{ .dout, .d }, .model, partitions),
-            store.maybeCreateTensor("bias", .{.dout}, .model, bias_partitions),
+    fn initProj(store: zml.io.TensorStore.View, partitions: anytype, bias_partitions: anytype) LinearLike {
+        return LinearLike.init(
+            store,
+            .{ .dout, .d },
+            .model,
+            partitions,
+            .{.dout},
+            .model,
+            bias_partitions,
             .d,
         );
     }
@@ -578,7 +785,12 @@ pub const SelfAttn = struct {
     }
 
     pub fn unloadBuffers(self: *zml.Bufferized(SelfAttn)) void {
-        zml.Buffer.deinitAll(SelfAttn, self);
+        LinearLike.unloadBuffers(&self.q_proj);
+        LinearLike.unloadBuffers(&self.k_proj);
+        LinearLike.unloadBuffers(&self.v_proj);
+        LinearLike.unloadBuffers(&self.o_proj);
+        RmsNorm.unloadBuffers(&self.q_norm);
+        RmsNorm.unloadBuffers(&self.k_norm);
     }
 
     fn projectQAndGate(self: SelfAttn, x: zml.Tensor) struct { zml.Tensor, zml.Tensor } {
@@ -761,11 +973,11 @@ pub const TextRotaryEmbedding = struct {
 };
 
 pub const GatedDeltaNet = struct {
-    in_proj_qkv: zml.nn.Linear,
-    in_proj_z: zml.nn.Linear,
-    in_proj_b: zml.nn.Linear,
-    in_proj_a: zml.nn.Linear,
-    out_proj: zml.nn.Linear,
+    in_proj_qkv: LinearLike,
+    in_proj_z: LinearLike,
+    in_proj_b: LinearLike,
+    in_proj_a: LinearLike,
+    out_proj: LinearLike,
     conv1d_weight: zml.Tensor,
     dt_bias: zml.Tensor,
     aLog: zml.Tensor,
@@ -778,8 +990,17 @@ pub const GatedDeltaNet = struct {
     head_v_dim: i64,
     conv_kernel_size: i64,
 
-    fn initProj(store: zml.io.TensorStore.View, partitions: anytype) zml.nn.Linear {
-        return .init(store.createTensor("weight", .{ .dout, .d }, .model, partitions), null, .d);
+    fn initProj(store: zml.io.TensorStore.View, partitions: anytype) LinearLike {
+        return LinearLike.init(
+            store,
+            .{ .dout, .d },
+            .model,
+            partitions,
+            .{.dout},
+            .model,
+            .{ .dout = .replicated },
+            .d,
+        );
     }
 
     pub fn init(store: zml.io.TensorStore.View, config: Config) GatedDeltaNet {
@@ -805,7 +1026,15 @@ pub const GatedDeltaNet = struct {
     }
 
     pub fn unloadBuffers(self: *zml.Bufferized(GatedDeltaNet)) void {
-        zml.Buffer.deinitAll(GatedDeltaNet, self);
+        LinearLike.unloadBuffers(&self.in_proj_qkv);
+        LinearLike.unloadBuffers(&self.in_proj_z);
+        LinearLike.unloadBuffers(&self.in_proj_b);
+        LinearLike.unloadBuffers(&self.in_proj_a);
+        LinearLike.unloadBuffers(&self.out_proj);
+        self.conv1d_weight.deinit();
+        self.dt_bias.deinit();
+        self.aLog.deinit();
+        RmsNormGated.unloadBuffers(&self.norm);
     }
 
     fn recurrentGatedDeltaRule(

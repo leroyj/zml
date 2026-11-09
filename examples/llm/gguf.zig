@@ -269,6 +269,19 @@ pub const Context = struct {
                     continue;
                 }
 
+                if (tensor.quant == .iq4_xs and layout.permute != .column) {
+                    const kb = @divExact(k, 256);
+                    const dims_qs = [_]i64{ n, @divExact(k, 2) };
+                    const dims_scl = [_]i64{ n, @divExact(k, 64) };
+                    const dims_sch = [_]i64{ n, kb };
+
+                    try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".iq4.qs", .iq4_qs, &dims_qs, .u8, layout, rows, row_len);
+                    try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".iq4.scl", .iq4_scl, &dims_scl, .u8, layout, rows, row_len);
+                    try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".iq4.sch", .iq4_sch, &dims_sch, .u16, layout, rows, row_len);
+                    try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".iq4.d", .iq4_d, &dims_sch, .f16, layout, rows, row_len);
+                    continue;
+                }
+
                 if (tensor.quant == .q6_k and layout.permute != .column) {
                     const kb = @divExact(k, 256);
                     const dims_ql = [_]i64{ n, kb, 2, 32 };
@@ -910,7 +923,7 @@ const Layout = struct {
     transform: Transform = .none,
 };
 
-const Output = enum { bf16, q8_quants, q8_scales, q4_qs, q4_sc, q4_mn, q4_d, q4_dmin, q5_qs, q5_qh, q5_sc, q5_mn, q5_d, q5_dmin, q6_ql0, q6_ql1, q6_qh, q6_sc1, q6_sc2, q6_sc3, q6_sc4, q6_d };
+const Output = enum { bf16, q8_quants, q8_scales, q4_qs, q4_sc, q4_mn, q4_d, q4_dmin, q5_qs, q5_qh, q5_sc, q5_mn, q5_d, q5_dmin, q6_ql0, q6_ql1, q6_qh, q6_sc1, q6_sc2, q6_sc3, q6_sc4, q6_d, iq4_qs, iq4_scl, iq4_sch, iq4_d };
 
 const DequantCtx = struct {
     data: []const u8,
@@ -962,6 +975,9 @@ const DequantCtx = struct {
             .q6_ql0, .q6_ql1, .q6_qh => if (self.permute == .none) chunk_elements / 4 else self.row_len / 4,
             .q6_sc1, .q6_sc2, .q6_sc3, .q6_sc4 => if (self.permute == .none) chunk_elements / 256 * 4 else self.row_len / 256 * 4,
             .q6_d => if (self.permute == .none) chunk_elements / 256 * 2 else self.row_len / 256 * 2,
+            .iq4_qs => if (self.permute == .none) chunk_elements / 2 else self.row_len / 2,
+            .iq4_scl => if (self.permute == .none) chunk_elements / 64 else self.row_len / 64,
+            .iq4_sch, .iq4_d => if (self.permute == .none) chunk_elements / 256 * 2 else self.row_len / 256 * 2,
         };
 
         const out = try allocator.alloc(u8, out_len);
@@ -1042,7 +1058,7 @@ const DequantCtx = struct {
         const src = ctx.data[src_offset..][0..src_len];
 
         switch (ctx.output) {
-            .q4_qs, .q4_sc, .q4_mn, .q4_d, .q4_dmin, .q5_qs, .q5_qh, .q5_sc, .q5_mn, .q5_d, .q5_dmin, .q6_ql0, .q6_ql1, .q6_qh, .q6_sc1, .q6_sc2, .q6_sc3, .q6_sc4, .q6_d => {
+            .q4_qs, .q4_sc, .q4_mn, .q4_d, .q4_dmin, .q5_qs, .q5_qh, .q5_sc, .q5_mn, .q5_d, .q5_dmin, .q6_ql0, .q6_ql1, .q6_qh, .q6_sc1, .q6_sc2, .q6_sc3, .q6_sc4, .q6_d, .iq4_qs, .iq4_scl, .iq4_sch, .iq4_d => {
                 var out_off: usize = 0;
                 for (0..n_blocks) |block_index| {
                     const block = src[block_index * block_size ..][0..block_size];
@@ -1121,7 +1137,7 @@ const DequantCtx = struct {
         const src = ctx.data[src_offset..][0..src_len];
 
         switch (ctx.output) {
-            .q4_qs, .q4_sc, .q4_mn, .q4_d, .q4_dmin, .q5_qs, .q5_qh, .q5_sc, .q5_mn, .q5_d, .q5_dmin, .q6_ql0, .q6_ql1, .q6_qh, .q6_sc1, .q6_sc2, .q6_sc3, .q6_sc4, .q6_d => {
+            .q4_qs, .q4_sc, .q4_mn, .q4_d, .q4_dmin, .q5_qs, .q5_qh, .q5_sc, .q5_mn, .q5_d, .q5_dmin, .q6_ql0, .q6_ql1, .q6_qh, .q6_sc1, .q6_sc2, .q6_sc3, .q6_sc4, .q6_d, .iq4_qs, .iq4_scl, .iq4_sch, .iq4_d => {
                 var out_off: usize = 0;
                 for (0..blocks_per_row) |block_index| {
                     const block = src[block_index * block_size ..][0..block_size];
@@ -1277,6 +1293,22 @@ fn writeKPart(output: Output, block: []const u8, out: []u8) usize {
         },
         .q6_d => {
             @memcpy(out[0..2], block[208..210]);
+            return 2;
+        },
+        .iq4_qs => {
+            @memcpy(out[0..128], block[8..136]);
+            return 128;
+        },
+        .iq4_scl => {
+            @memcpy(out[0..4], block[4..8]);
+            return 4;
+        },
+        .iq4_sch => {
+            @memcpy(out[0..2], block[2..4]);
+            return 2;
+        },
+        .iq4_d => {
+            @memcpy(out[0..2], block[0..2]);
             return 2;
         },
         else => unreachable,

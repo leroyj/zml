@@ -65,8 +65,10 @@ pub fn fetchRegistry(
 
 pub const TensorReader = struct {
     tensor: Tensor,
-    file: std.Io.File,
-    file_reader: std.Io.File.Reader,
+    file: ?std.Io.File,
+    file_reader: ?std.Io.File.Reader,
+    custom: ?Tensor.Custom = null,
+    custom_state: ?*anyopaque = null,
     alignment: ?std.mem.Alignment,
     remaining: u64,
     padding_remaining: u64,
@@ -84,6 +86,30 @@ pub const TensorReader = struct {
         buffer: []u8,
         opts: InitOpts,
     ) !TensorReader {
+        if (tensor.custom) |custom| {
+            const state = try custom.start(custom.ctx, io, &tensor);
+            return .{
+                .tensor = tensor,
+                .file = null,
+                .file_reader = null,
+                .custom = custom,
+                .custom_state = state,
+                .alignment = null,
+                .remaining = tensor.byteSize(),
+                .padding_remaining = 0,
+                .io = io,
+                .interface = .{
+                    .vtable = &.{
+                        .stream = streamCustom,
+                        .discard = discardCustom,
+                    },
+                    .buffer = &.{},
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+
         const file = try std.Io.Dir.openFile(.cwd(), io, tensor.file_uri, .{ .mode = .read_only });
         errdefer file.close(io);
 
@@ -125,7 +151,11 @@ pub const TensorReader = struct {
     }
 
     pub fn deinit(self: *TensorReader) void {
-        self.file.close(self.io);
+        if (self.custom) |custom| {
+            if (self.custom_state) |state| custom.stop(state, self.io);
+        } else if (self.file) |file| {
+            file.close(self.io);
+        }
     }
 
     // Limit single reads to 1GB to avoid issues on macOS where pread returns
@@ -139,7 +169,7 @@ pub const TensorReader = struct {
         }
 
         const combined_limit = limit.min(.limited64(self.remaining)).min(.limited64(max_single_read_bytes));
-        const n = try self.file_reader.interface.stream(w, combined_limit);
+        const n = try self.file_reader.?.interface.stream(w, combined_limit);
         self.remaining -= n;
         return n;
     }
@@ -151,7 +181,48 @@ pub const TensorReader = struct {
         }
 
         const combined_limit = limit.min(.limited64(self.remaining));
-        const n = try self.file_reader.interface.discard(combined_limit);
+        const n = try self.file_reader.?.interface.discard(combined_limit);
+        self.remaining -= n;
+        return n;
+    }
+
+    fn streamCustom(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *TensorReader = @fieldParentPtr("interface", r);
+        if (self.remaining == 0) {
+            return error.EndOfStream;
+        }
+
+        const max_bytes = limit.minInt64(self.remaining);
+        if (max_bytes == 0) return 0;
+
+        const custom = self.custom.?;
+        const n = custom.fill(self.custom_state.?, self.io, w, max_bytes) catch |err| {
+            log.err("Custom reader failed for tensor {s}: {}", .{ self.tensor.name, err });
+            return error.ReadFailed;
+        };
+        if (n == 0) return error.EndOfStream;
+        self.remaining -= n;
+        return n;
+    }
+
+    fn discardCustom(r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
+        const self: *TensorReader = @fieldParentPtr("interface", r);
+        if (self.remaining == 0) {
+            return error.EndOfStream;
+        }
+
+        const max_bytes = limit.minInt64(self.remaining);
+        if (max_bytes == 0) return 0;
+
+        var discard_buffer: [4096]u8 = undefined;
+        var discarding: std.Io.Writer.Discarding = .init(&discard_buffer);
+
+        const custom = self.custom.?;
+        const n = custom.fill(self.custom_state.?, self.io, &discarding.writer, max_bytes) catch |err| {
+            log.err("Custom reader failed for tensor {s}: {}", .{ self.tensor.name, err });
+            return error.ReadFailed;
+        };
+        if (n == 0) return error.EndOfStream;
         self.remaining -= n;
         return n;
     }
@@ -165,12 +236,12 @@ pub const TensorReader = struct {
         const requested_bytes = @min(limit.minInt64(self.remaining), max_single_read_bytes);
 
         if (self.padding_remaining > 0) {
-            _ = try self.file_reader.interface.discard(.limited64(self.padding_remaining));
+            _ = try self.file_reader.?.interface.discard(.limited64(self.padding_remaining));
             self.padding_remaining = 0;
         }
 
         const align_bytes = self.alignment.?.toByteUnits();
-        const file_offset = self.file_reader.pos - std.mem.alignBackward(u64, self.file_reader.pos, align_bytes);
+        const file_offset = self.file_reader.?.pos - std.mem.alignBackward(u64, self.file_reader.?.pos, align_bytes);
         const writer_addr = @intFromPtr(w.buffer.ptr) + w.end;
         const writer_offset = writer_addr - std.mem.alignBackward(usize, writer_addr, align_bytes);
 
@@ -186,22 +257,22 @@ pub const TensorReader = struct {
 
         if (w.writableSliceGreedy(align_bytes)) |dest| {
             const phys_buf = dest.ptr - file_offset;
-            const phys_pos = self.file_reader.pos - file_offset;
+            const phys_pos = self.file_reader.?.pos - file_offset;
             const phys_size = std.mem.alignBackward(usize, @min(dest.len, requested_bytes) + file_offset, align_bytes);
 
             if (phys_size > file_offset) {
-                const phys_read = self.file.readPositional(self.io, &.{phys_buf[0..phys_size]}, phys_pos) catch unreachable;
+                const phys_read = self.file.?.readPositional(self.io, &.{phys_buf[0..phys_size]}, phys_pos) catch unreachable;
                 if (phys_read > file_offset) {
                     const bytes_read = phys_read - file_offset;
                     w.advance(bytes_read);
-                    self.file_reader.pos += bytes_read;
+                    self.file_reader.?.pos += bytes_read;
                     self.remaining -= bytes_read;
                     return bytes_read;
                 }
             }
         } else |_| {}
 
-        const bytes_read = try self.file_reader.interface.stream(w, .limited64(requested_bytes));
+        const bytes_read = try self.file_reader.?.interface.stream(w, .limited64(requested_bytes));
         self.remaining -= bytes_read;
 
         return bytes_read;
@@ -212,12 +283,12 @@ pub const TensorReader = struct {
         if (self.remaining == 0) return 0;
 
         if (self.padding_remaining > 0) {
-            _ = try self.file_reader.interface.discard(.limited64(self.padding_remaining));
+            _ = try self.file_reader.?.interface.discard(.limited64(self.padding_remaining));
             self.padding_remaining = 0;
         }
 
         const combined_limit = limit.min(.limited64(self.remaining));
-        const n = try self.file_reader.interface.discard(combined_limit);
+        const n = try self.file_reader.?.interface.discard(combined_limit);
         self.remaining -= n;
         return n;
     }
@@ -228,6 +299,20 @@ pub const Tensor = struct {
     name: []const u8,
     shape: Shape,
     offset: u64,
+    custom: ?Custom = null,
+
+    /// Optional custom streaming source. When set, the tensor data is produced
+    /// by `fill` instead of being read verbatim from `file_uri` at `offset`.
+    /// This is used to dequantize GGUF tensors on the fly.
+    pub const Custom = struct {
+        ctx: *const anyopaque,
+        /// Creates per-reader state. The state must not retain `tensor`.
+        start: *const fn (ctx: *const anyopaque, io: std.Io, tensor: *const Tensor) anyerror!*anyopaque,
+        /// Writes at most `max_bytes` bytes to `writer` and returns the number
+        /// of bytes written. Returns 0 at end of stream.
+        fill: *const fn (state: *anyopaque, io: std.Io, writer: *std.Io.Writer, max_bytes: usize) anyerror!usize,
+        stop: *const fn (state: *anyopaque, io: std.Io) void,
+    };
 
     pub fn byteSize(self: Tensor) u64 {
         return self.shape.byteSize();

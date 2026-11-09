@@ -56,6 +56,18 @@ pub const LimitedGroup = struct {
                     }
                 }
             }
+
+            /// Used by `concurrent`, where the caller has already acquired the
+            /// in-flight slot before spawning the worker.
+            fn concurrentWrapper(self: *LimitedGroup, io: std.Io, args: std.meta.ArgsTuple(@TypeOf(function))) std.Io.Cancelable!void {
+                defer {
+                    self.mutex.lockUncancelable(io);
+                    defer self.mutex.unlock(io);
+                    _ = self.in_flight.fetchSub(1, .release);
+                    self.cond.signal(io);
+                }
+                return @call(.auto, function, args);
+            }
         };
     }
 
@@ -68,7 +80,34 @@ pub const LimitedGroup = struct {
     }
 
     pub fn concurrent(self: *LimitedGroup, io: std.Io, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) std.Io.ConcurrentError!void {
-        try self.group.concurrent(io, Wrapper(function).wrapper, .{ self, io, args });
+        // Acquire the slot before spawning the worker so the number of live
+        // worker threads never exceeds `limit`.
+        while (true) {
+            var in_flight = self.in_flight.load(.acquire);
+            while (in_flight < self.limit) {
+                if (self.in_flight.cmpxchgWeak(in_flight, in_flight + 1, .release, .acquire)) |actual| {
+                    in_flight = actual;
+                    continue;
+                }
+
+                self.group.concurrent(io, Wrapper(function).concurrentWrapper, .{ self, io, args }) catch |err| {
+                    self.mutex.lockUncancelable(io);
+                    defer self.mutex.unlock(io);
+                    _ = self.in_flight.fetchSub(1, .release);
+                    self.cond.signal(io);
+                    return err;
+                };
+                return;
+            }
+
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            while (self.in_flight.load(.acquire) >= self.limit) {
+                self.cond.wait(io, &self.mutex) catch |err| switch (err) {
+                    error.Canceled => return error.ConcurrencyUnavailable,
+                };
+            }
+        }
     }
 
     pub fn await(self: *LimitedGroup, io: std.Io) std.Io.Cancelable!void {

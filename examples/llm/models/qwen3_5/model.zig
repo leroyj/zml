@@ -6,6 +6,7 @@ const stdx = zml.stdx;
 const common = @import("../common.zig");
 const inference = @import("inference.zig");
 const q8_triton = @import("../../gguf/q8_triton.zig");
+const q4k_triton = @import("../../gguf/q4k_triton.zig");
 
 const log = std.log.scoped(.qwen3_5);
 
@@ -407,6 +408,19 @@ pub const TransformerLayer = struct {
         };
     }
 
+    pub fn schemeKey(self: TransformerLayer) LayerKey {
+        var key: LayerKey = .{
+            .kind = std.meta.activeTag(self.attn),
+            .schemes = @splat(.bf16),
+        };
+        switch (self.attn) {
+            .full_attention => |attn| attn.writeSchemeKey(&key.schemes),
+            .linear_attention => |attn| attn.writeSchemeKey(&key.schemes),
+        }
+        self.mlp.writeSchemeKey(&key.schemes, 5);
+        return key;
+    }
+
     pub fn unloadBuffers(self: *zml.Bufferized(TransformerLayer)) void {
         RmsNorm.unloadBuffers(&self.input_layernorm);
         switch (self.attn) {
@@ -503,7 +517,7 @@ pub const TransformerLayer = struct {
     }
 };
 
-pub const QuantizedLinear = struct {
+pub const QuantizedLinearQ8 = struct {
     quants: zml.Tensor,
     scales: zml.Tensor,
     bias: ?zml.Tensor,
@@ -520,7 +534,7 @@ pub const QuantizedLinear = struct {
         bias_mesh: @EnumLiteral(),
         bias_partitioning: anytype,
         comptime contraction_tag: anytype,
-    ) QuantizedLinear {
+    ) QuantizedLinearQ8 {
         _ = tags;
         const contraction: zml.Shape.Tag = zml.Shape.toTag(contraction_tag);
         const is_d = comptime std.mem.eql(u8, @tagName(contraction_tag), "d");
@@ -540,12 +554,13 @@ pub const QuantizedLinear = struct {
         };
     }
 
-    pub fn forward(self: QuantizedLinear, x: zml.Tensor, dtype: zml.DataType) zml.Tensor {
+    pub fn forward(self: QuantizedLinearQ8, x: zml.Tensor, dtype: zml.DataType) zml.Tensor {
         _ = dtype;
         const x_shape = x.shape();
         const d = x.dim(self.contraction_tag);
         const m: i64 = @divExact(@as(i64, @intCast(x_shape.count())), d);
         const x_flat = x.reshape(zml.Shape.init(.{ .m = m, .k = d }, x.dtype()));
+        const n = self.quants.dim(.n);
 
         const use_kernel = switch (zml.Compiler.current().platform.target) {
             .rocm, .cuda => true,
@@ -553,16 +568,11 @@ pub const QuantizedLinear = struct {
         };
 
         const out_padded = if (!use_kernel) blk: {
-            const n = self.quants.dim(.n);
-            const nb = @divExact(d, 32);
-            const q = self.quants.reshape(zml.Shape.init(.{ .n = n, .nb = nb, .block = 32 }, .i8)).convert(.f32);
-            const s = self.scales.reshape(zml.Shape.init(.{ .n = n, .nb = nb, .one = 1 }, .f16)).convert(.f32);
-            const w = q.mul(s.broad(q.shape())).reshape(zml.Shape.init(.{ .n = n, .k = d }, .f32)).convert(.bf16);
+            const w = q8GraphDequant(self.quants, self.scales, n, d);
             break :blk x_flat.dot(w, .k);
         } else if (m == 1) blk: {
             const x_row = x_flat.reshape(zml.Shape.init(.{ .k = d }, x.dtype()));
-            const out_row = q8Matvec1(x_row, self.quants, self.scales, self.block_n);
-            break :blk out_row.reshape(zml.Shape.init(.{ .m = 1, .n = self.quants.dim(.n) }, .bf16));
+            break :blk q8Matvec1(x_row, self.quants, self.scales, self.block_n).reshape(zml.Shape.init(.{ .m = 1, .n = n }, .bf16));
         } else blk: {
             const m_padded = std.mem.alignForward(i64, m, 16);
             const x_padded = if (m_padded == m) x_flat else blk2: {
@@ -573,12 +583,125 @@ pub const QuantizedLinear = struct {
         };
 
         const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
-        const out_shape = x_shape.setDim(self.contraction_tag, self.quants.dim(.n));
+        const out_shape = x_shape.setDim(self.contraction_tag, n);
         var out = out_flat.reshape(out_shape).renameTag(self.contraction_tag, self.output_tag);
         if (self.bias) |bias| out = out.add(bias.broad(out.shape()));
         return out;
     }
 };
+
+pub const QuantizedLinearQ4 = struct {
+    qs: zml.Tensor,
+    sc: zml.Tensor,
+    mn: zml.Tensor,
+    d: zml.Tensor,
+    dmin: zml.Tensor,
+    bias: ?zml.Tensor,
+    contraction_tag: zml.Shape.Tag,
+    output_tag: zml.Shape.Tag,
+    block_n: i64,
+
+    pub fn init(
+        store: zml.io.TensorStore.View,
+        tags: anytype,
+        mesh_: @EnumLiteral(),
+        partitioning: anytype,
+        bias_tags: anytype,
+        bias_mesh: @EnumLiteral(),
+        bias_partitioning: anytype,
+        comptime contraction_tag: anytype,
+    ) QuantizedLinearQ4 {
+        _ = tags;
+        const contraction: zml.Shape.Tag = zml.Shape.toTag(contraction_tag);
+        const is_d = comptime std.mem.eql(u8, @tagName(contraction_tag), "d");
+        const output: zml.Shape.Tag = if (is_d) zml.Shape.toTag(.dout) else zml.Shape.toTag(.d);
+        const output_partition = if (is_d) partitioning.dout else partitioning.d;
+
+        const qs = store.createTensor("weight.q4.qs", .{ .n, .k2 }, mesh_, .{ .n = output_partition, .k2 = .replicated });
+        const dout = qs.dim(.n);
+        return .{
+            .qs = qs,
+            .sc = store.createTensor("weight.q4.sc", .{ .n, .kb, .eight }, mesh_, .{ .n = output_partition, .kb = .replicated, .eight = .replicated }),
+            .mn = store.createTensor("weight.q4.mn", .{ .n, .kb, .eight }, mesh_, .{ .n = output_partition, .kb = .replicated, .eight = .replicated }),
+            .d = store.createTensor("weight.q4.d", .{ .n, .kb }, mesh_, .{ .n = output_partition, .kb = .replicated }),
+            .dmin = store.createTensor("weight.q4.dmin", .{ .n, .kb }, mesh_, .{ .n = output_partition, .kb = .replicated }),
+            .bias = store.maybeCreateTensor("bias", bias_tags, bias_mesh, bias_partitioning),
+            .contraction_tag = contraction,
+            .output_tag = output,
+            .block_n = if (dout >= 64) 64 else 16,
+        };
+    }
+
+    pub fn forward(self: QuantizedLinearQ4, x: zml.Tensor, dtype: zml.DataType) zml.Tensor {
+        _ = dtype;
+        const x_shape = x.shape();
+        const d = x.dim(self.contraction_tag);
+        const m: i64 = @divExact(@as(i64, @intCast(x_shape.count())), d);
+        const x_flat = x.reshape(zml.Shape.init(.{ .m = m, .k = d }, x.dtype()));
+        const n = self.qs.dim(.n);
+
+        const use_kernel = switch (zml.Compiler.current().platform.target) {
+            .rocm, .cuda => true,
+            else => false,
+        };
+
+        const out_padded = if (!use_kernel) blk: {
+            const w = q4GraphDequant(self.qs, self.sc, self.mn, self.d, self.dmin, n, d);
+            break :blk x_flat.dot(w, .k);
+        } else if (m == 1) blk: {
+            const x_row = x_flat.reshape(zml.Shape.init(.{ .k = d }, x.dtype()));
+            break :blk q4Matvec1(x_row, self.qs, self.sc, self.mn, self.d, self.dmin, self.block_n).reshape(zml.Shape.init(.{ .m = 1, .n = n }, .bf16));
+        } else blk: {
+            const m_padded = std.mem.alignForward(i64, m, 16);
+            const x_padded = if (m_padded == m) x_flat else blk2: {
+                const zeros = zml.Tensor.scalar(0, x.dtype()).broad(zml.Shape.init(.{ .m = m_padded - m, .k = d }, x.dtype()));
+                break :blk2 zml.Tensor.concatenate(&.{ x_flat, zeros }, .m);
+            };
+            break :blk q4Matvec(x_padded, self.qs, self.sc, self.mn, self.d, self.dmin, self.block_n);
+        };
+
+        const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
+        const out_shape = x_shape.setDim(self.contraction_tag, n);
+        var out = out_flat.reshape(out_shape).renameTag(self.contraction_tag, self.output_tag);
+        if (self.bias) |bias| out = out.add(bias.broad(out.shape()));
+        return out;
+    }
+};
+
+fn q8GraphDequant(quants: zml.Tensor, scales: zml.Tensor, n: i64, k: i64) zml.Tensor {
+    const nb = @divExact(k, 32);
+    const q = quants.reshape(zml.Shape.init(.{ .n = n, .nb = nb, .block = 32 }, .i8)).convert(.f32);
+    const s = scales.reshape(zml.Shape.init(.{ .n = n, .nb = nb, .one = 1 }, .f16)).convert(.f32);
+    return q.mul(s.broad(q.shape())).reshape(zml.Shape.init(.{ .n = n, .k = k }, .f32)).convert(.bf16);
+}
+
+fn q4GraphDequant(
+    qs: zml.Tensor,
+    sc: zml.Tensor,
+    mn: zml.Tensor,
+    d: zml.Tensor,
+    dmin: zml.Tensor,
+    n: i64,
+    k: i64,
+) zml.Tensor {
+    const kb = @divExact(k, 256);
+    const q = qs.reshape(zml.Shape.init(.{ .n = n, .kb = kb, .g = 4, .e = 32 }, .u8));
+    const lo = q.logical(.AND, zml.Tensor.scalar(0x0F, .u8).broad(q.shape())).convert(.f32);
+    const hi = q.div(zml.Tensor.scalar(16, .u8).broad(q.shape())).convert(.f32);
+
+    const sc4 = sc.reshape(zml.Shape.init(.{ .n = n, .kb = kb, .g = 4, .e = 2 }, .u8)).convert(.f32);
+    const mn4 = mn.reshape(zml.Shape.init(.{ .n = n, .kb = kb, .g = 4, .e = 2 }, .u8)).convert(.f32);
+    const sc_lo, const sc_hi = sc4.chunkExact(.e, 2);
+    const mn_lo, const mn_hi = mn4.chunkExact(.e, 2);
+
+    const d4 = d.convert(.f32).reshape(zml.Shape.init(.{ .n = n, .kb = kb, .g = 1, .e = 1 }, .f32)).broad(q.shape());
+    const dmin4 = dmin.convert(.f32).reshape(zml.Shape.init(.{ .n = n, .kb = kb, .g = 1, .e = 1 }, .f32)).broad(q.shape());
+
+    const w_lo = d4.mul(sc_lo.broad(q.shape())).mul(lo).sub(dmin4.mul(mn_lo.broad(q.shape())));
+    const w_hi = d4.mul(sc_hi.broad(q.shape())).mul(hi).sub(dmin4.mul(mn_hi.broad(q.shape())));
+    const w = zml.Tensor.concatenate(&.{ w_lo, w_hi }, .e);
+    return w.reshape(zml.Shape.init(.{ .n = n, .k = k }, .f32)).convert(.bf16);
+}
 
 fn q8Matvec(x: zml.Tensor, quants: zml.Tensor, scales: zml.Tensor, block_n: i64) zml.Tensor {
     const m = x.dim(.m);
@@ -643,9 +766,75 @@ fn q8Matvec1(x: zml.Tensor, quants: zml.Tensor, scales: zml.Tensor, block_n: i64
     ).out;
 }
 
+fn q4Matvec(x: zml.Tensor, qs: zml.Tensor, sc: zml.Tensor, mn: zml.Tensor, d: zml.Tensor, dmin: zml.Tensor, block_n: i64) zml.Tensor {
+    const m = x.dim(.m);
+    const k = x.dim(.k);
+    const n = qs.dim(.n);
+    const kb = @divExact(k, 256);
+    const cfg: q4k_triton.Config = .{
+        .n = n,
+        .k = k,
+        .block_n = block_n,
+        .block_m = 16,
+        .stride_qs_n = @divExact(k, 2),
+        .stride_sc_n = kb * 8,
+        .stride_mn_n = kb * 8,
+        .stride_d_n = kb,
+        .stride_dmin_n = kb,
+    };
+    return q4k_triton.Q4KMatvec.call(
+        .{ .x_ptr = x, .qs_ptr = qs, .sc_ptr = sc, .mn_ptr = mn, .d_ptr = d, .dmin_ptr = dmin },
+        .{ .out = zml.Shape.init(.{ .m = m, .n = n }, .bf16) },
+        .{
+            .cfg = cfg,
+            .grid = .{ @intCast(@divExact(m, 16)), @intCast(@divExact(n, block_n)), 1 },
+            .num_stages = 3,
+            .num_warps = 4,
+        },
+    ).out;
+}
+
+fn q4Matvec1(x: zml.Tensor, qs: zml.Tensor, sc: zml.Tensor, mn: zml.Tensor, d: zml.Tensor, dmin: zml.Tensor, block_n: i64) zml.Tensor {
+    const k = x.dim(.k);
+    const n = qs.dim(.n);
+    const kb = @divExact(k, 256);
+    const cfg: q4k_triton.Config = .{
+        .n = n,
+        .k = k,
+        .block_n = block_n,
+        .block_m = 16,
+        .stride_qs_n = @divExact(k, 2),
+        .stride_sc_n = kb * 8,
+        .stride_mn_n = kb * 8,
+        .stride_d_n = kb,
+        .stride_dmin_n = kb,
+    };
+    return q4k_triton.Q4KMatvec1.call(
+        .{ .x_ptr = x, .qs_ptr = qs, .sc_ptr = sc, .mn_ptr = mn, .d_ptr = d, .dmin_ptr = dmin },
+        .{ .out = zml.Shape.init(.{ .n = n }, .bf16) },
+        .{
+            .cfg = cfg,
+            .grid = .{ @intCast(@divExact(n, block_n)), 1, 1 },
+            .num_stages = 3,
+            .num_warps = 4,
+        },
+    ).out;
+}
+
 pub const LinearLike = union(enum) {
     bf16: zml.nn.Linear,
-    q8: QuantizedLinear,
+    q8: QuantizedLinearQ8,
+    q4: QuantizedLinearQ4,
+
+    pub const Scheme = enum { bf16, q8, q4 };
+
+    pub fn scheme(self: LinearLike) Scheme {
+        return switch (self) {
+            .bf16 => .bf16,
+            .q8 => .q8,
+            .q4 => .q4,
+        };
+    }
 
     pub fn init(
         store: zml.io.TensorStore.View,
@@ -657,8 +846,11 @@ pub const LinearLike = union(enum) {
         bias_partitioning: anytype,
         comptime contraction_tag: anytype,
     ) LinearLike {
+        if (store.getShape("weight.q4.qs") != null) {
+            return .{ .q4 = QuantizedLinearQ4.init(store, tags, mesh_, partitioning, bias_tags, bias_mesh, bias_partitioning, contraction_tag) };
+        }
         if (store.getShape("weight.q8") != null) {
-            return .{ .q8 = QuantizedLinear.init(store, tags, mesh_, partitioning, bias_tags, bias_mesh, bias_partitioning, contraction_tag) };
+            return .{ .q8 = QuantizedLinearQ8.init(store, tags, mesh_, partitioning, bias_tags, bias_mesh, bias_partitioning, contraction_tag) };
         }
         return .{ .bf16 = zml.nn.Linear.init(
             store.createTensor("weight", tags, mesh_, partitioning),
@@ -671,14 +863,25 @@ pub const LinearLike = union(enum) {
         return switch (self) {
             .bf16 => |linear| linear.forward(x, dtype),
             .q8 => |linear| linear.forward(x, dtype),
+            .q4 => |linear| linear.forward(x, dtype),
         };
     }
 
     pub fn unloadBuffers(self: *zml.Bufferized(LinearLike)) void {
         switch (self.*) {
             .bf16 => |*linear| zml.nn.Linear.unloadBuffers(linear),
-            .q8 => |*linear| zml.Buffer.deinitAll(QuantizedLinear, linear),
+            .q8 => |*linear| zml.Buffer.deinitAll(QuantizedLinearQ8, linear),
+            .q4 => |*linear| zml.Buffer.deinitAll(QuantizedLinearQ4, linear),
         }
+    }
+};
+
+pub const LayerKey = struct {
+    kind: LayerType,
+    schemes: [8]LinearLike.Scheme,
+
+    pub fn eql(a: LayerKey, b: LayerKey) bool {
+        return a.kind == b.kind and std.mem.eql(LinearLike.Scheme, &a.schemes, &b.schemes);
     }
 };
 
@@ -686,6 +889,12 @@ pub const Mlp = struct {
     up_proj: LinearLike,
     gate_proj: LinearLike,
     down_proj: LinearLike,
+
+    fn writeSchemeKey(self: Mlp, schemes: *[8]LinearLike.Scheme, offset: usize) void {
+        schemes[offset + 0] = self.up_proj.scheme();
+        schemes[offset + 1] = self.gate_proj.scheme();
+        schemes[offset + 2] = self.down_proj.scheme();
+    }
 
     pub fn init(store: zml.io.TensorStore.View) Mlp {
         return .{
@@ -791,6 +1000,13 @@ pub const SelfAttn = struct {
         LinearLike.unloadBuffers(&self.o_proj);
         RmsNorm.unloadBuffers(&self.q_norm);
         RmsNorm.unloadBuffers(&self.k_norm);
+    }
+
+    fn writeSchemeKey(self: SelfAttn, schemes: *[8]LinearLike.Scheme) void {
+        schemes[0] = self.q_proj.scheme();
+        schemes[1] = self.k_proj.scheme();
+        schemes[2] = self.v_proj.scheme();
+        schemes[3] = self.o_proj.scheme();
     }
 
     fn projectQAndGate(self: SelfAttn, x: zml.Tensor) struct { zml.Tensor, zml.Tensor } {
@@ -1035,6 +1251,14 @@ pub const GatedDeltaNet = struct {
         self.dt_bias.deinit();
         self.aLog.deinit();
         RmsNormGated.unloadBuffers(&self.norm);
+    }
+
+    fn writeSchemeKey(self: GatedDeltaNet, schemes: *[8]LinearLike.Scheme) void {
+        schemes[0] = self.in_proj_qkv.scheme();
+        schemes[1] = self.in_proj_z.scheme();
+        schemes[2] = self.in_proj_b.scheme();
+        schemes[3] = self.in_proj_a.scheme();
+        schemes[4] = self.out_proj.scheme();
     }
 
     fn recurrentGatedDeltaRule(

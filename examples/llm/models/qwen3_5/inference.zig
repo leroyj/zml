@@ -78,16 +78,32 @@ pub const CompiledModel = struct {
 pub const Inference = CompiledModel;
 
 pub const KernelExe = struct {
+    allocator: std.mem.Allocator,
     embed: zml.FnExe(model.EmbedTokens.forward),
-    full_attention: zml.FnExe(model.TransformerLayer.forwardSelfAttn),
-    linear_attention: zml.FnExe(model.TransformerLayer.forwardLinearAttn),
+    full_attention: []zml.FnExe(model.TransformerLayer.forwardSelfAttn),
+    linear_attention: []zml.FnExe(model.TransformerLayer.forwardLinearAttn),
+    full_keys: []model.LayerKey,
+    linear_keys: []model.LayerKey,
+    layer_keys: []model.LayerKey,
     sample: zml.FnExe(model.Sampler.sampleTokens),
 
     pub fn deinit(self: *const KernelExe) void {
         self.embed.deinit();
-        self.full_attention.deinit();
-        self.linear_attention.deinit();
+        for (self.full_attention) |*exe| exe.deinit();
+        for (self.linear_attention) |*exe| exe.deinit();
+        self.allocator.free(self.full_attention);
+        self.allocator.free(self.linear_attention);
+        self.allocator.free(self.full_keys);
+        self.allocator.free(self.linear_keys);
+        self.allocator.free(self.layer_keys);
         self.sample.deinit();
+    }
+
+    fn exeIndex(keys: []const model.LayerKey, key: model.LayerKey) usize {
+        for (keys, 0..) |candidate, index| {
+            if (candidate.eql(key)) return index;
+        }
+        unreachable;
     }
 };
 
@@ -117,15 +133,15 @@ pub const KernelRunner = struct {
         errdefer allocator.free(layers);
         var initialized_layers: usize = 0;
         errdefer for (layers[0..initialized_layers]) |*layer| layer.deinit(allocator);
-        for (layers, buffers.text_model.layers) |*layer, layer_buffers| {
+        for (layers, buffers.text_model.layers, exe.layer_keys) |*layer, layer_buffers, key| {
             layer.* = switch (layer_buffers.attn) {
                 .full_attention => .{ .full_attention = try zml.FnExe(model.TransformerLayer.forwardSelfAttn).Runner(.{.layer}).init(
-                    &exe.full_attention,
+                    &exe.full_attention[KernelExe.exeIndex(exe.full_keys, key)],
                     allocator,
                     .{ .layer = layer_buffers },
                 ) },
                 .linear_attention => .{ .linear_attention = try zml.FnExe(model.TransformerLayer.forwardLinearAttn).Runner(.{.layer}).init(
-                    &exe.linear_attention,
+                    &exe.linear_attention[KernelExe.exeIndex(exe.linear_keys, key)],
                     allocator,
                     .{ .layer = layer_buffers },
                 ) },
@@ -229,18 +245,80 @@ fn compileKernel(
     phase: Phase,
     progress: *std.Progress.Node,
 ) !KernelExe {
-    const full_index = findFirstLayerIndex(qwen_model.config.text_config.layer_types, .full_attention) orelse return error.MissingFullAttentionLayer;
-    const linear_index = findFirstLayerIndex(qwen_model.config.text_config.layer_types, .linear_attention) orelse return error.MissingLinearAttentionLayer;
-
     const embed = try compileEmbed(allocator, io, platform, qwen_model, parameters, seqlen, phase, progress);
     errdefer embed.deinit();
-    const full_attention = try compileFullAttention(allocator, io, platform, qwen_model, parameters, seqlen, full_index, phase, progress);
-    errdefer full_attention.deinit();
-    const linear_attention = try compileLinearAttention(allocator, io, platform, qwen_model, parameters, seqlen, linear_index, phase, progress);
-    errdefer linear_attention.deinit();
+
+    var full_keys: std.ArrayList(model.LayerKey) = .empty;
+    defer full_keys.deinit(allocator);
+    var full_attention: std.ArrayList(zml.FnExe(model.TransformerLayer.forwardSelfAttn)) = .empty;
+    errdefer {
+        for (full_attention.items) |*exe| exe.deinit();
+        full_attention.deinit(allocator);
+    }
+
+    var linear_keys: std.ArrayList(model.LayerKey) = .empty;
+    defer linear_keys.deinit(allocator);
+    var linear_attention: std.ArrayList(zml.FnExe(model.TransformerLayer.forwardLinearAttn)) = .empty;
+    errdefer {
+        for (linear_attention.items) |*exe| exe.deinit();
+        linear_attention.deinit(allocator);
+    }
+
+    const layer_keys = try allocator.alloc(model.LayerKey, qwen_model.text_model.layers.len);
+    errdefer allocator.free(layer_keys);
+
+    for (qwen_model.text_model.layers, 0..) |layer, layer_index| {
+        const key = layer.schemeKey();
+        layer_keys[layer_index] = key;
+        switch (key.kind) {
+            .full_attention => {
+                if (containsLayerKey(full_keys.items, key)) continue;
+                try full_keys.append(allocator, key);
+                try full_attention.append(allocator, try compileFullAttention(allocator, io, platform, qwen_model, parameters, seqlen, layer_index, phase, progress));
+            },
+            .linear_attention => {
+                if (containsLayerKey(linear_keys.items, key)) continue;
+                try linear_keys.append(allocator, key);
+                try linear_attention.append(allocator, try compileLinearAttention(allocator, io, platform, qwen_model, parameters, seqlen, layer_index, phase, progress));
+            },
+        }
+    }
+
+    const full_attention_owned = try full_attention.toOwnedSlice(allocator);
+    errdefer {
+        for (full_attention_owned) |*exe| exe.deinit();
+        allocator.free(full_attention_owned);
+    }
+    const full_keys_owned = try full_keys.toOwnedSlice(allocator);
+    errdefer allocator.free(full_keys_owned);
+    const linear_attention_owned = try linear_attention.toOwnedSlice(allocator);
+    errdefer {
+        for (linear_attention_owned) |*exe| exe.deinit();
+        allocator.free(linear_attention_owned);
+    }
+    const linear_keys_owned = try linear_keys.toOwnedSlice(allocator);
+    errdefer allocator.free(linear_keys_owned);
+
     const sample = try compileSample(allocator, io, platform, qwen_model, parameters, seqlen, phase, progress);
     errdefer sample.deinit();
-    return .{ .embed = embed, .full_attention = full_attention, .linear_attention = linear_attention, .sample = sample };
+
+    return .{
+        .allocator = allocator,
+        .embed = embed,
+        .full_attention = full_attention_owned,
+        .linear_attention = linear_attention_owned,
+        .full_keys = full_keys_owned,
+        .linear_keys = linear_keys_owned,
+        .layer_keys = layer_keys,
+        .sample = sample,
+    };
+}
+
+fn containsLayerKey(keys: []const model.LayerKey, key: model.LayerKey) bool {
+    for (keys) |candidate| {
+        if (candidate.eql(key)) return true;
+    }
+    return false;
 }
 
 fn compileEmbed(allocator: std.mem.Allocator, io: std.Io, platform: *const zml.Platform, mdl: model.Model, parameters: CompilationOptions, seqlen: usize, phase: Phase, progress: *std.Progress.Node) !zml.FnExe(model.EmbedTokens.forward) {
@@ -312,9 +390,4 @@ fn hiddenTensor(mdl: model.Model, seqlen: usize, mesh: *const zml.Mesh) zml.Tens
         .{ .b = 1, .s = seqlen, .d = mdl.config.text_config.hidden_size },
         mdl.text_model.embed_tokens.weight.dtype(),
     ).withPartitioning(mesh, .{ .b = .replicated, .s = .replicated, .d = .replicated }));
-}
-
-fn findFirstLayerIndex(layer_types: []const model.LayerType, target: model.LayerType) ?usize {
-    for (layer_types, 0..) |layer_type, index| if (layer_type == target) return index;
-    return null;
 }

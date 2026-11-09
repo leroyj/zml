@@ -254,6 +254,21 @@ pub const Context = struct {
             if (quantize) {
                 const k: i64 = @intCast(tensor.dims[0]);
                 const n: i64 = @intCast(tensor.dims[1]);
+
+                if (tensor.quant == .q4_k and layout.permute != .column) {
+                    const kb = @divExact(k, 256);
+                    const dims_qs = [_]i64{ n, @divExact(k, 2) };
+                    const dims_sc = [_]i64{ n, kb, 8 };
+                    const dims_d = [_]i64{ n, kb };
+
+                    try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".q4.qs", .q4_qs, &dims_qs, .u8, layout, rows, row_len);
+                    try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".q4.sc", .q4_sc, &dims_sc, .u8, layout, rows, row_len);
+                    try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".q4.mn", .q4_mn, &dims_sc, .u8, layout, rows, row_len);
+                    try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".q4.d", .q4_d, &dims_d, .f16, layout, rows, row_len);
+                    try self.registerQuantized(&result, arena_allocator, tensor, hf_name, ".q4.dmin", .q4_dmin, &dims_d, .f16, layout, rows, row_len);
+                    continue;
+                }
+
                 const dims_q = [_]i64{ n, k };
                 const dims_s = [_]i64{ n, @divExact(k, 32) };
 
@@ -862,7 +877,7 @@ const Layout = struct {
     transform: Transform = .none,
 };
 
-const Output = enum { bf16, q8_quants, q8_scales };
+const Output = enum { bf16, q8_quants, q8_scales, q4_qs, q4_sc, q4_mn, q4_d, q4_dmin };
 
 const DequantCtx = struct {
     data: []const u8,
@@ -904,12 +919,19 @@ const DequantCtx = struct {
             .bf16 => if (self.permute == .none) chunk_elements * 2 else self.row_len * 2,
             .q8_quants => if (self.permute == .none) chunk_elements else self.row_len,
             .q8_scales => if (self.permute == .none) chunk_elements / 32 * 2 else self.row_len / 32 * 2,
+            .q4_qs => if (self.permute == .none) chunk_elements / 2 else self.row_len / 2,
+            .q4_sc, .q4_mn => if (self.permute == .none) chunk_elements / 256 * 8 else self.row_len / 256 * 8,
+            .q4_d, .q4_dmin => if (self.permute == .none) chunk_elements / 256 * 2 else self.row_len / 256 * 2,
         };
 
         const out = try allocator.alloc(u8, out_len);
         errdefer allocator.free(out);
 
-        const f32_row = try allocator.alloc(f32, if (self.output != .bf16 and self.permute != .none) self.row_len else 0);
+        const needs_f32_row = switch (self.output) {
+            .q8_quants, .q8_scales => self.permute != .none,
+            else => false,
+        };
+        const f32_row = try allocator.alloc(f32, if (needs_f32_row) self.row_len else 0);
         errdefer allocator.free(f32_row);
 
         state.* = .{
@@ -979,6 +1001,22 @@ const DequantCtx = struct {
         if (src_offset + src_len > ctx.data.len) return error.UnexpectedEndOfFile;
         const src = ctx.data[src_offset..][0..src_len];
 
+        switch (ctx.output) {
+            .q4_qs, .q4_sc, .q4_mn, .q4_d, .q4_dmin => {
+                var out_off: usize = 0;
+                for (0..n_blocks) |block_index| {
+                    const block = src[block_index * block_size ..][0..block_size];
+                    out_off += writeQ4KPart(ctx.output, block, self.out[out_off..]);
+                }
+                self.blocks_done += n_blocks;
+                self.elems_done += n_elems;
+                self.out_len = out_off;
+                self.out_pos = 0;
+                return;
+            },
+            else => {},
+        }
+
         var out_off: usize = 0;
         switch (ctx.quant) {
             inline else => |q| {
@@ -1017,6 +1055,7 @@ const DequantCtx = struct {
                                 }
                             }
                         },
+                        else => unreachable,
                     }
                 }
             },
@@ -1040,6 +1079,21 @@ const DequantCtx = struct {
         const src_offset = ctx.offset + source_row * src_len;
         if (src_offset + src_len > ctx.data.len) return error.UnexpectedEndOfFile;
         const src = ctx.data[src_offset..][0..src_len];
+
+        switch (ctx.output) {
+            .q4_qs, .q4_sc, .q4_mn, .q4_d, .q4_dmin => {
+                var out_off: usize = 0;
+                for (0..blocks_per_row) |block_index| {
+                    const block = src[block_index * block_size ..][0..block_size];
+                    out_off += writeQ4KPart(ctx.output, block, self.out[out_off..]);
+                }
+                self.out_row += 1;
+                self.out_len = out_off;
+                self.out_pos = 0;
+                return;
+            },
+            else => {},
+        }
 
         switch (ctx.output) {
             .bf16 => {
@@ -1106,12 +1160,48 @@ const DequantCtx = struct {
                 }
                 self.out_len = out_off;
             },
+            else => unreachable,
         }
 
         self.out_row += 1;
         self.out_pos = 0;
     }
 };
+
+fn getScaleMinK4(j: usize, q: *const [12]u8) struct { u8, u8 } {
+    if (j < 4) return .{ q[j] & 63, q[j + 4] & 63 };
+    return .{
+        (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4),
+        (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+    };
+}
+
+fn writeQ4KPart(output: Output, block: []const u8, out: []u8) usize {
+    switch (output) {
+        .q4_qs => {
+            @memcpy(out[0..128], block[16..144]);
+            return 128;
+        },
+        .q4_sc, .q4_mn => {
+            var scales: [12]u8 = undefined;
+            @memcpy(&scales, block[4..16]);
+            for (0..8) |j| {
+                const sc, const mn = getScaleMinK4(j, &scales);
+                out[j] = if (output == .q4_sc) sc else mn;
+            }
+            return 8;
+        },
+        .q4_d => {
+            @memcpy(out[0..2], block[0..2]);
+            return 2;
+        },
+        .q4_dmin => {
+            @memcpy(out[0..2], block[2..4]);
+            return 2;
+        },
+        else => unreachable,
+    }
+}
 
 fn q8Scale(values: []const f32) f32 {
     var max_abs: f32 = 0.0;

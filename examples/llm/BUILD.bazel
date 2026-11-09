@@ -115,3 +115,17 @@ oci_load(
     repo_tags = ["zmlai/llm:debug"],
     tags = ["manual"],
 )
+
+zig_binary(
+    name = "dflash2_test",
+    srcs = [
+        "dflash2_test.zig",
+        "gguf.zig",
+        "gguf/dflash2_model.zig",
+        "gguf/quants.zig",
+        "models/common.zig",
+    ],
+    main = "dflash2_test.zig",
+    visibility = ["//visibility:public"],
+    deps = ["//zml"],
+)

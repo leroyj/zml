@@ -142,6 +142,9 @@ pub const Context = struct {
             if (metadata.get("qwen35.block_count")) |value| {
                 break :blk @as(usize, @intCast(intValue(value) orelse return error.MissingMetadata));
             }
+            if (metadata.get("dflash.block_count")) |value| {
+                break :blk @as(usize, @intCast(intValue(value) orelse return error.MissingMetadata));
+            }
             break :blk 0;
         };
         const nextn_layers = blk: {
@@ -151,11 +154,12 @@ pub const Context = struct {
             break :blk 0;
         };
 
-        const group_count: usize = @intCast(metadataInt(metadata, "qwen35.ssm.group_count") orelse return error.MissingMetadata);
-        const time_step_rank: usize = @intCast(metadataInt(metadata, "qwen35.ssm.time_step_rank") orelse return error.MissingMetadata);
-        const state_size: usize = @intCast(metadataInt(metadata, "qwen35.ssm.state_size") orelse return error.MissingMetadata);
-        const inner_size: usize = @intCast(metadataInt(metadata, "qwen35.ssm.inner_size") orelse return error.MissingMetadata);
-        if (group_count == 0 or time_step_rank % group_count != 0) return error.InvalidMetadataType;
+        const group_count: usize = @intCast(metadataInt(metadata, "qwen35.ssm.group_count") orelse 0);
+        const time_step_rank: usize = @intCast(metadataInt(metadata, "qwen35.ssm.time_step_rank") orelse 0);
+        const state_size: usize = @intCast(metadataInt(metadata, "qwen35.ssm.state_size") orelse 0);
+        const inner_size: usize = @intCast(metadataInt(metadata, "qwen35.ssm.inner_size") orelse 0);
+        const num_v_per_k: usize = if (group_count > 0 and time_step_rank % group_count == 0) time_step_rank / group_count else 1;
+        const head_v_dim: usize = if (time_step_rank > 0) inner_size / time_step_rank else 0;
 
         return .{
             .arena = arena,
@@ -167,9 +171,9 @@ pub const Context = struct {
             .data_offset = data_offset,
             .num_layers = block_count -| nextn_layers,
             .num_k_heads = group_count,
-            .num_v_per_k = time_step_rank / group_count,
+            .num_v_per_k = num_v_per_k,
             .head_k_dim = state_size,
-            .head_v_dim = inner_size / time_step_rank,
+            .head_v_dim = head_v_dim,
         };
     }
 
@@ -447,6 +451,57 @@ pub const Context = struct {
         }
 
         return .{};
+    }
+
+    /// Builds a registry for the `dflash` draft architecture, dequantizing
+    /// every tensor to bf16 on the fly.
+    pub fn registryDflash(self: *Context, allocator: std.mem.Allocator) !zml.safetensors.TensorRegistry {
+        var result: zml.safetensors.TensorRegistry = .init(allocator);
+        errdefer result.deinit();
+
+        const arena_allocator = self.arena.allocator();
+
+        for (self.tensors) |tensor| {
+            const hf_name = try mapDflashName(arena_allocator, tensor.name) orelse continue;
+
+            var dims_buffer: [4]i64 = undefined;
+            const dims = dflashDims(tensor, &dims_buffer) orelse continue;
+
+            const rows: usize = if (tensor.dims.len == 1) @intCast(tensor.dims[0]) else @intCast(tensor.dims[1]);
+            const row_len: usize = if (tensor.dims.len == 1) 1 else @intCast(tensor.dims[0]);
+
+            const ctx = try arena_allocator.create(DequantCtx);
+            ctx.* = .{
+                .data = self.mapped,
+                .quant = tensor.quant,
+                .offset = @intCast(self.data_offset + tensor.offset),
+                .numel = @intCast(tensor.numel),
+                .rows = rows,
+                .row_len = row_len,
+                .permute = .none,
+                .perm_offset = 0,
+                .head_dim = 0,
+                .num_k_heads = 0,
+                .num_v_per_k = 1,
+                .transform = .none,
+                .output = .bf16,
+            };
+
+            try result.registerTensor(.{
+                .file_uri = self.file_uri,
+                .name = hf_name,
+                .shape = .init(dims, .bf16),
+                .offset = self.data_offset + tensor.offset,
+                .custom = .{
+                    .ctx = ctx,
+                    .start = DequantCtx.start,
+                    .fill = DequantCtx.fill,
+                    .stop = DequantCtx.stop,
+                },
+            });
+        }
+
+        return result;
     }
 
     /// Creates the cache directory containing `config.json` and
@@ -869,6 +924,68 @@ const layer_tensor_map = .{
     .{ "ffn_up.weight", "mlp.up_proj.weight" },
     .{ "ffn_down.weight", "mlp.down_proj.weight" },
 };
+
+fn mapDflashName(allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    if (std.mem.eql(u8, name, "fc.weight")) return "fc.weight";
+    if (std.mem.eql(u8, name, "enc.output_norm.weight")) return "hidden_norm.weight";
+    if (std.mem.eql(u8, name, "output_norm.weight")) return "norm.weight";
+    if (std.mem.eql(u8, name, "selector_hidden.weight")) return "selector_hidden.weight";
+    if (std.mem.eql(u8, name, "selector_predecessor.weight")) return "selector_predecessor.weight";
+    if (std.mem.eql(u8, name, "selector_successor.weight")) return "selector_successor.weight";
+
+    if (!std.mem.startsWith(u8, name, "blk.")) return null;
+    const rest = name[4..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    const layer = rest[0..dot];
+    const suffix = rest[dot + 1 ..];
+
+    const mapped_suffix: []const u8 = if (std.mem.eql(u8, suffix, "attn_norm.weight"))
+        "input_layernorm.weight"
+    else if (std.mem.eql(u8, suffix, "attn_q.weight"))
+        "self_attn.q_proj.weight"
+    else if (std.mem.eql(u8, suffix, "attn_k.weight"))
+        "self_attn.k_proj.weight"
+    else if (std.mem.eql(u8, suffix, "attn_v.weight"))
+        "self_attn.v_proj.weight"
+    else if (std.mem.eql(u8, suffix, "attn_output.weight"))
+        "self_attn.o_proj.weight"
+    else if (std.mem.eql(u8, suffix, "attn_q_norm.weight"))
+        "self_attn.q_norm.weight"
+    else if (std.mem.eql(u8, suffix, "attn_k_norm.weight"))
+        "self_attn.k_norm.weight"
+    else if (std.mem.eql(u8, suffix, "attn_conv_proj.weight"))
+        "self_attn.attn_conv_proj.weight"
+    else if (std.mem.eql(u8, suffix, "attn_conv_base"))
+        "self_attn.attn_conv_base"
+    else if (std.mem.eql(u8, suffix, "ffn_norm.weight"))
+        "post_attention_layernorm.weight"
+    else if (std.mem.eql(u8, suffix, "ffn_gate.weight"))
+        "mlp.gate_proj.weight"
+    else if (std.mem.eql(u8, suffix, "ffn_up.weight"))
+        "mlp.up_proj.weight"
+    else if (std.mem.eql(u8, suffix, "ffn_down.weight"))
+        "mlp.down_proj.weight"
+    else if (std.mem.eql(u8, suffix, "ffn_conv_proj.weight"))
+        "ffn_conv_proj.weight"
+    else if (std.mem.eql(u8, suffix, "ffn_conv_base"))
+        "ffn_conv_base"
+    else
+        return null;
+
+    return try std.fmt.allocPrint(allocator, "layers.{s}.{s}", .{ layer, mapped_suffix });
+}
+
+fn dflashDims(tensor: TensorInfo, buffer: *[4]i64) ?[]const i64 {
+    if (tensor.dims.len > buffer.len) return null;
+    if (std.mem.endsWith(u8, tensor.name, "_conv_base")) {
+        for (0..tensor.dims.len) |i| buffer[i] = @intCast(tensor.dims[i]);
+        return buffer[0..tensor.dims.len];
+    }
+    for (0..tensor.dims.len) |i| {
+        buffer[i] = @intCast(tensor.dims[tensor.dims.len - 1 - i]);
+    }
+    return buffer[0..tensor.dims.len];
+}
 
 fn mapName(allocator: std.mem.Allocator, name: []const u8, num_layers: usize) !?[]const u8 {
     if (std.mem.startsWith(u8, name, "blk.")) {

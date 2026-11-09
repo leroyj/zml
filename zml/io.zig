@@ -379,6 +379,15 @@ pub const Loader = struct {
 
     pub const LoadError = error{TransformedTensorNotDelivered};
 
+    /// Schedules a tensor load on a worker thread. `Group.async` runs the task
+    /// on the calling thread when the Io implementation queues it there, which
+    /// serializes the loader; `concurrent` uses the worker pool instead.
+    fn schedule(self: *Loader, io: std.Io, comptime function: anytype, args: std.meta.ArgsTuple(@TypeOf(function))) void {
+        self.group.concurrent(io, function, args) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => self.group.async(io, function, args),
+        };
+    }
+
     pub fn load(self: *Loader, io: std.Io, comptime T: type, model: *const T, buffers: *Bufferized(T), store: *const TensorStore, opts: LoadOpts) LoadError!void {
         const tensor_count = meta.count(Tensor, model);
 
@@ -420,7 +429,7 @@ pub const Loader = struct {
                 if (sources.transformed) continue;
             }
 
-            self.group.async(io, defaultCallback, .{ self, io, tensor, buffer, store, opts });
+            self.schedule(io, defaultCallback, .{ self, io, tensor, buffer, store, opts });
         }
     }
 
@@ -439,7 +448,7 @@ pub const Loader = struct {
     }
 
     pub fn loadBuffer(loader: *Loader, io: std.Io, buffer: *Buffer, tensor: *const Tensor, store: *const TensorStore, opts: LoadOpts) void {
-        loader.group.async(io, defaultCallback, .{ loader, io, tensor, buffer, store, opts });
+        loader.schedule(io, defaultCallback, .{ loader, io, tensor, buffer, store, opts });
     }
 
     fn defaultCallback(self: *Loader, io: std.Io, tensor: *const Tensor, buffer: *Buffer, store: *const TensorStore, opts: LoadOpts) void {
@@ -536,7 +545,7 @@ pub const Loader = struct {
         defer if (node) |*n| n.end();
 
         for (sources, 0..) |source, i| {
-            self.group.async(io, loadSingle, .{ self, io, source, source.shape, &buffers[i], &loaded[i], .{} });
+            self.schedule(io, loadSingle, .{ self, io, source, source.shape, &buffers[i], &loaded[i], .{} });
         }
         self.group.await(io) catch |err| switch (err) {
             error.Canceled => return error.Canceled,

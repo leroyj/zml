@@ -10,6 +10,7 @@ const q4k_triton = @import("../../gguf/q4k_triton.zig");
 const q5k_triton = @import("../../gguf/q5k_triton.zig");
 const q6k_triton = @import("../../gguf/q6k_triton.zig");
 const iq4xs_triton = @import("../../gguf/iq4xs_triton.zig");
+const iq4nl_triton = @import("../../gguf/iq4nl_triton.zig");
 
 const log = std.log.scoped(.qwen3_5);
 
@@ -913,6 +914,78 @@ pub const QuantizedLinearIq4Xs = struct {
     }
 };
 
+pub const QuantizedLinearIq4Nl = struct {
+    qs: zml.Tensor,
+    d: zml.Tensor,
+    bias: ?zml.Tensor,
+    contraction_tag: zml.Shape.Tag,
+    output_tag: zml.Shape.Tag,
+    block_n: i64,
+
+    pub fn init(
+        store: zml.io.TensorStore.View,
+        tags: anytype,
+        mesh_: @EnumLiteral(),
+        partitioning: anytype,
+        bias_tags: anytype,
+        bias_mesh: @EnumLiteral(),
+        bias_partitioning: anytype,
+        comptime contraction_tag: anytype,
+    ) QuantizedLinearIq4Nl {
+        _ = tags;
+        const contraction: zml.Shape.Tag = zml.Shape.toTag(contraction_tag);
+        const is_d = comptime std.mem.eql(u8, @tagName(contraction_tag), "d");
+        const output: zml.Shape.Tag = if (is_d) zml.Shape.toTag(.dout) else zml.Shape.toTag(.d);
+        const output_partition = if (is_d) partitioning.dout else partitioning.d;
+
+        const qs = store.createTensor("weight.iq4nl.qs", .{ .n, .k2 }, mesh_, .{ .n = output_partition, .k2 = .replicated });
+        const dout = qs.dim(.n);
+        return .{
+            .qs = qs,
+            .d = store.createTensor("weight.iq4nl.d", .{ .n, .k32 }, mesh_, .{ .n = output_partition, .k32 = .replicated }),
+            .bias = store.maybeCreateTensor("bias", bias_tags, bias_mesh, bias_partitioning),
+            .contraction_tag = contraction,
+            .output_tag = output,
+            .block_n = if (dout >= 64) 64 else 16,
+        };
+    }
+
+    pub fn forward(self: QuantizedLinearIq4Nl, x: zml.Tensor, dtype: zml.DataType) zml.Tensor {
+        _ = dtype;
+        const x_shape = x.shape();
+        const d = x.dim(self.contraction_tag);
+        const m: i64 = @divExact(@as(i64, @intCast(x_shape.count())), d);
+        const x_flat = x.reshape(zml.Shape.init(.{ .m = m, .k = d }, x.dtype()));
+        const n = self.qs.dim(.n);
+
+        const use_kernel = switch (zml.Compiler.current().platform.target) {
+            .rocm, .cuda => true,
+            else => false,
+        };
+
+        const out_padded = if (!use_kernel) blk: {
+            const w = iq4nlGraphDequant(self.qs, self.d, n, d);
+            break :blk x_flat.dot(w, .k);
+        } else if (m == 1) blk: {
+            const x_row = x_flat.reshape(zml.Shape.init(.{ .k = d }, x.dtype()));
+            break :blk iq4nlMatvec1(x_row, self.qs, self.d, self.block_n).reshape(zml.Shape.init(.{ .m = 1, .n = n }, .bf16));
+        } else blk: {
+            const m_padded = std.mem.alignForward(i64, m, 16);
+            const x_padded = if (m_padded == m) x_flat else blk2: {
+                const zeros = zml.Tensor.scalar(0, x.dtype()).broad(zml.Shape.init(.{ .m = m_padded - m, .k = d }, x.dtype()));
+                break :blk2 zml.Tensor.concatenate(&.{ x_flat, zeros }, .m);
+            };
+            break :blk iq4nlMatvec(x_padded, self.qs, self.d, self.block_n);
+        };
+
+        const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
+        const out_shape = x_shape.setDim(self.contraction_tag, n);
+        var out = out_flat.reshape(out_shape).renameTag(self.contraction_tag, self.output_tag);
+        if (self.bias) |bias| out = out.add(bias.broad(out.shape()));
+        return out;
+    }
+};
+
 fn q8GraphDequant(quants: zml.Tensor, scales: zml.Tensor, n: i64, k: i64) zml.Tensor {
     const nb = @divExact(k, 32);
     const q = quants.reshape(zml.Shape.init(.{ .n = n, .nb = nb, .block = 32 }, .i8)).convert(.f32);
@@ -1091,6 +1164,21 @@ fn iq4GraphDequant(
     const dl4 = dl.reshape(zml.Shape.init(.{ .n = n, .kb = kb, .ib = 8, .one = 1 }, .f32));
     const w_lo = val_lo.mul(dl4.broad(val_lo.shape()));
     const w_hi = val_hi.mul(dl4.broad(val_hi.shape()));
+    const w = zml.Tensor.concatenate(&.{ w_lo, w_hi }, -1);
+    return w.reshape(zml.Shape.init(.{ .n = n, .k = k }, .f32)).convert(.bf16);
+}
+
+fn iq4nlGraphDequant(qs: zml.Tensor, d: zml.Tensor, n: i64, k: i64) zml.Tensor {
+    const nb = @divExact(k, 32);
+    const qshape = zml.Shape.init(.{ .n = n, .nb = nb, .e = 16 }, .u8);
+    const q = qs.reshape(qshape);
+    const lo = q.logical(.AND, zml.Tensor.scalar(0x0F, .u8).broad(qshape));
+    const hi = q.shiftRightLogical(zml.Tensor.scalar(4, .u8).broad(qshape)).logical(.AND, zml.Tensor.scalar(0x0F, .u8).broad(qshape));
+    const val_lo = iq4Lut(lo);
+    const val_hi = iq4Lut(hi);
+    const d3 = d.convert(.f32).reshape(zml.Shape.init(.{ .n = n, .nb = nb, .one = 1 }, .f32)).broad(val_lo.shape());
+    const w_lo = val_lo.mul(d3);
+    const w_hi = val_hi.mul(d3);
     const w = zml.Tensor.concatenate(&.{ w_lo, w_hi }, -1);
     return w.reshape(zml.Shape.init(.{ .n = n, .k = k }, .f32)).convert(.bf16);
 }
@@ -1378,6 +1466,55 @@ fn iq4Matvec1(x: zml.Tensor, qs: zml.Tensor, scl: zml.Tensor, sch: zml.Tensor, d
     ).out;
 }
 
+fn iq4nlMatvec(x: zml.Tensor, qs: zml.Tensor, d: zml.Tensor, block_n: i64) zml.Tensor {
+    const m = x.dim(.m);
+    const k = x.dim(.k);
+    const n = qs.dim(.n);
+    const cfg: iq4nl_triton.Config = .{
+        .n = n,
+        .k = k,
+        .block_n = block_n,
+        .block_m = 16,
+        .stride_qs_n = @divExact(k, 2),
+        .stride_d_n = @divExact(k, 32),
+    };
+    const lut = zml.Tensor.constantTensor(zml.Shape.init(.{ .e = 16 }, .i8), std.mem.sliceAsBytes(&kvalues_iq4nl));
+    return iq4nl_triton.Iq4NlMatvec.call(
+        .{ .x_ptr = x, .qs_ptr = qs, .d_ptr = d, .lut_ptr = lut },
+        .{ .out = zml.Shape.init(.{ .m = m, .n = n }, .bf16) },
+        .{
+            .cfg = cfg,
+            .grid = .{ @intCast(@divExact(m, 16)), @intCast(@divExact(n, block_n)), 1 },
+            .num_stages = 3,
+            .num_warps = 4,
+        },
+    ).out;
+}
+
+fn iq4nlMatvec1(x: zml.Tensor, qs: zml.Tensor, d: zml.Tensor, block_n: i64) zml.Tensor {
+    const k = x.dim(.k);
+    const n = qs.dim(.n);
+    const cfg: iq4nl_triton.Config = .{
+        .n = n,
+        .k = k,
+        .block_n = block_n,
+        .block_m = 16,
+        .stride_qs_n = @divExact(k, 2),
+        .stride_d_n = @divExact(k, 32),
+    };
+    const lut = zml.Tensor.constantTensor(zml.Shape.init(.{ .e = 16 }, .i8), std.mem.sliceAsBytes(&kvalues_iq4nl));
+    return iq4nl_triton.Iq4NlMatvec1.call(
+        .{ .x_ptr = x, .qs_ptr = qs, .d_ptr = d, .lut_ptr = lut },
+        .{ .out = zml.Shape.init(.{ .n = n }, .bf16) },
+        .{
+            .cfg = cfg,
+            .grid = .{ @intCast(@divExact(n, block_n)), 1, 1 },
+            .num_stages = 3,
+            .num_warps = 4,
+        },
+    ).out;
+}
+
 pub const LinearLike = union(enum) {
     bf16: zml.nn.Linear,
     q8: QuantizedLinearQ8,
@@ -1385,8 +1522,9 @@ pub const LinearLike = union(enum) {
     q5: QuantizedLinearQ5,
     q6: QuantizedLinearQ6,
     iq4: QuantizedLinearIq4Xs,
+    iq4nl: QuantizedLinearIq4Nl,
 
-    pub const Scheme = enum { bf16, q8, q4, q5, q6, iq4 };
+    pub const Scheme = enum { bf16, q8, q4, q5, q6, iq4, iq4nl };
 
     pub fn scheme(self: LinearLike) Scheme {
         return switch (self) {
@@ -1396,6 +1534,7 @@ pub const LinearLike = union(enum) {
             .q5 => .q5,
             .q6 => .q6,
             .iq4 => .iq4,
+            .iq4nl => .iq4nl,
         };
     }
 
@@ -1409,6 +1548,9 @@ pub const LinearLike = union(enum) {
         bias_partitioning: anytype,
         comptime contraction_tag: anytype,
     ) LinearLike {
+        if (store.getShape("weight.iq4nl.qs") != null) {
+            return .{ .iq4nl = QuantizedLinearIq4Nl.init(store, tags, mesh_, partitioning, bias_tags, bias_mesh, bias_partitioning, contraction_tag) };
+        }
         if (store.getShape("weight.iq4.qs") != null) {
             return .{ .iq4 = QuantizedLinearIq4Xs.init(store, tags, mesh_, partitioning, bias_tags, bias_mesh, bias_partitioning, contraction_tag) };
         }
@@ -1439,6 +1581,7 @@ pub const LinearLike = union(enum) {
             .q5 => |linear| linear.forward(x, dtype),
             .q6 => |linear| linear.forward(x, dtype),
             .iq4 => |linear| linear.forward(x, dtype),
+            .iq4nl => |linear| linear.forward(x, dtype),
         };
     }
 
@@ -1450,6 +1593,7 @@ pub const LinearLike = union(enum) {
             .q5 => |*linear| zml.Buffer.deinitAll(QuantizedLinearQ5, linear),
             .q6 => |*linear| zml.Buffer.deinitAll(QuantizedLinearQ6, linear),
             .iq4 => |*linear| zml.Buffer.deinitAll(QuantizedLinearIq4Xs, linear),
+            .iq4nl => |*linear| zml.Buffer.deinitAll(QuantizedLinearIq4Nl, linear),
         }
     }
 };

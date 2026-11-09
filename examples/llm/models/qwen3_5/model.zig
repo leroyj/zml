@@ -136,6 +136,36 @@ pub const LoadedModel = struct {
 
 pub const Buffers = zml.Bufferized(Model);
 
+fn sampleLogits(logits_: zml.Tensor, sampling: zml.nn.SamplingStrategy, rng: zml.Tensor.Rng) struct { zml.Tensor, zml.Tensor.Rng } {
+    const logits = logits_.withPartialTags(.{.voc});
+    const temperature: f32 = if (sampling.temperature < 0.00001) 1.0 else sampling.temperature;
+    const topk: u32 = if (sampling.temperature < 0.00001) 1 else @intCast(logits.dim(.voc));
+    const tokens, const updated_rng = zml.nn.sampleTokens(logits, .{ .topk = topk, .temperature = temperature }, rng);
+    return .{ tokens.convert(.u32), updated_rng };
+}
+
+fn verifyDraftTokens(
+    draft_tokens_: zml.Tensor,
+    target_logits_: zml.Tensor,
+    sampling: zml.nn.SamplingStrategy,
+    rng: zml.Tensor.Rng,
+) struct { zml.Tensor, zml.Tensor, zml.Tensor.Rng } {
+    const draft_tokens = draft_tokens_.withPartialTags(.{.s});
+    const target_logits = target_logits_.withPartialTags(.{ .s, .voc });
+    const draft_len = draft_tokens.dim(.s);
+    const verify_len = draft_len - 1;
+
+    const sampled_tokens, const updated_rng = sampleLogits(target_logits, sampling, rng);
+    const proposals = draft_tokens.slice(.s, .{ .start = 1, .end = draft_len });
+    const posterior = sampled_tokens.slice(.s, .{ .start = 0, .end = verify_len });
+    const matches = proposals.cmp(.EQ, posterior);
+    const candidate_idx = zml.Tensor.iota(.init(.{ .s = verify_len }, .u32), .s).convert(.u32);
+    const sentinel = zml.Tensor.scalar(@as(u32, @intCast(verify_len)), .u32).broad(candidate_idx.shape());
+    const valid_draft_tokens = matches.select(sentinel, candidate_idx).min(.s).squeeze(.s);
+    const correction_token = sampled_tokens.gather(.{ .s = valid_draft_tokens }, .{}).convert(.u32);
+    return .{ valid_draft_tokens, correction_token, updated_rng };
+}
+
 pub const Model = struct {
     pub const GenOptions = struct { sampling_strategy: zml.nn.SamplingStrategy = .{}, max_seq_len: i64 };
 
@@ -241,6 +271,57 @@ pub const Model = struct {
         return .{ result.tokens, updated_kv_cache, result.rng };
     }
 
+    pub fn prefillForward(
+        self: Model,
+        tokens: zml.Tensor,
+        token_index: zml.Tensor,
+        active_length: zml.Tensor,
+        kv_cache: KvCache,
+        target_layer_ids: []const u32,
+        rng: zml.Tensor.Rng,
+    ) struct { zml.Tensor, zml.Tensor, KvCache, zml.Tensor.Rng } {
+        const tokens_ = tokens.withPartialTags(.{.s});
+        const target_hidden, const hidden, const updated_kv_cache = self.text_model.forwardWithTaps(
+            tokens_,
+            token_index,
+            active_length,
+            kv_cache,
+            target_layer_ids,
+        );
+        const last = hidden.slice(.s, .dyn(active_length.convert(.i32).addConstant(-1), 1));
+        const logits = self.sampler().logitsAll(last);
+        const next_token, const updated_rng = zml.nn.sampleTokens(logits, self.gen_options.sampling_strategy, rng);
+        return .{ target_hidden, next_token.convert(.u32), updated_kv_cache, updated_rng };
+    }
+
+    pub fn verifyForward(
+        self: Model,
+        tokens: zml.Tensor,
+        draft_tokens: zml.Tensor,
+        token_index: zml.Tensor,
+        active_length: zml.Tensor,
+        kv_cache: KvCache,
+        target_layer_ids: []const u32,
+        rng: zml.Tensor.Rng,
+    ) struct { zml.Tensor, zml.Tensor, zml.Tensor, KvCache, zml.Tensor.Rng } {
+        const tokens_ = tokens.withPartialTags(.{.s});
+        const target_hidden, const hidden, const updated_kv_cache = self.text_model.forwardWithTaps(
+            tokens_,
+            token_index,
+            active_length,
+            kv_cache,
+            target_layer_ids,
+        );
+        const logits = self.sampler().logitsAll(hidden);
+        const valid_draft_tokens, const correction_token, const updated_rng = verifyDraftTokens(
+            draft_tokens,
+            logits,
+            self.gen_options.sampling_strategy,
+            rng,
+        );
+        return .{ target_hidden, valid_draft_tokens, correction_token, updated_kv_cache, updated_rng };
+    }
+
     pub fn sampler(self: Model) Sampler {
         return .{
             .norm = self.text_model.norm,
@@ -282,6 +363,12 @@ pub const Sampler = struct {
             .rng = new_rng,
             .token_index = input.token_index.addConstant(1).reuseBuffer(input.token_index),
         };
+    }
+
+    /// Logits for every position, used by speculative verification.
+    pub fn logitsAll(self: Sampler, hidden: zml.Tensor) zml.Tensor {
+        const x = self.norm.forward(hidden);
+        return self.lm_head.forward(x.withPartialTags(.{.d}), x.dtype()).rename(.{ .dout = .voc });
     }
 };
 
@@ -360,6 +447,39 @@ pub const TextModel = struct {
         }
 
         return .{ hidden_states, updated_kv_cache.reuseBuffer(kv_cache) };
+    }
+
+    /// Runs the text model and returns the concatenated hidden states at
+    /// `target_layer_ids` alongside the final hidden state.
+    pub fn forwardWithTaps(
+        self: TextModel,
+        tokens: zml.Tensor,
+        token_index: zml.Tensor,
+        active_length: zml.Tensor,
+        kv_cache: KvCache,
+        target_layer_ids: []const u32,
+    ) struct { zml.Tensor, zml.Tensor, KvCache } {
+        var hidden_states = EmbedTokens.forward(.{
+            .embedding = .{ .embed_tokens = self.embed_tokens },
+            .tokens = tokens,
+        }).hidden;
+
+        var updated_kv_cache = kv_cache;
+        var selected: [16]zml.Tensor = undefined;
+        var selected_len: usize = 0;
+        for (self.layers, 0..) |layer, i| {
+            hidden_states, updated_kv_cache = layer.forward(hidden_states, token_index, active_length, updated_kv_cache.atLayer(i));
+            for (target_layer_ids) |target| {
+                if (target == i) {
+                    selected[selected_len] = hidden_states;
+                    selected_len += 1;
+                    break;
+                }
+            }
+        }
+
+        const target_hidden = zml.Tensor.concatenate(selected[0..selected_len], .d);
+        return .{ target_hidden, hidden_states, updated_kv_cache.reuseBuffer(kv_cache) };
     }
 };
 

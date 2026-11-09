@@ -129,3 +129,11 @@ zig_binary(
     visibility = ["//visibility:public"],
     deps = ["//zml"],
 )
+
+zig_binary(
+    name = "dflash2_spec",
+    srcs = glob(["**/*.zig"]),
+    main = "dflash2_spec.zig",
+    visibility = ["//visibility:public"],
+    deps = ["//zml"],
+)

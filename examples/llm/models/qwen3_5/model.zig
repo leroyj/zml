@@ -159,7 +159,7 @@ fn verifyDraftTokens(
     const proposals = draft_tokens.slice(.s, .{ .start = 1, .end = draft_len });
     const posterior = sampled_tokens.slice(.s, .{ .start = 0, .end = verify_len });
     const matches = proposals.cmp(.EQ, posterior);
-    const candidate_idx = zml.Tensor.iota(.init(.{ .s = verify_len }, .u32), .s).convert(.u32);
+    const candidate_idx = zml.Tensor.iota(.init(.{ .b = 1, .s = verify_len }, .u32), .s).convert(.u32);
     const sentinel = zml.Tensor.scalar(@as(u32, @intCast(verify_len)), .u32).broad(candidate_idx.shape());
     const valid_draft_tokens = matches.select(sentinel, candidate_idx).min(.s).squeeze(.s);
     const correction_token = sampled_tokens.gather(.{ .s = valid_draft_tokens }, .{}).convert(.u32);
@@ -478,7 +478,7 @@ pub const TextModel = struct {
             }
         }
 
-        const target_hidden = zml.Tensor.concatenate(selected[0..selected_len], .d);
+        const target_hidden = zml.Tensor.concatenate(selected[0..selected_len], .d).squeeze(.b);
         return .{ target_hidden, hidden_states, updated_kv_cache.reuseBuffer(kv_cache) };
     }
 };
@@ -2179,7 +2179,7 @@ pub const GatedDeltaNet = struct {
         const projected_qkv = self.in_proj_qkv.forward(x_in, x_in.dtype())
             .rename(.{ .dout = .mix })
             .withPartitioning(.model, .{ .s = .replicated, .mix = .model });
-        const use_cached_state = x.dim(.s) == 1 and left_pad > 0;
+        const use_cached_state = left_pad > 0;
         const conv_input = b: {
             if (use_cached_state) break :b zml.Tensor.concatenate(&.{ cache.convState(), projected_qkv }, .s);
             break :b projected_qkv;
@@ -2206,7 +2206,7 @@ pub const GatedDeltaNet = struct {
             .silu();
 
         if (use_cached_state) {
-            mixed_qkv = mixed_qkv.slice(.s, .{ .start = mixed_qkv.dim(.s) - 1, .end = mixed_qkv.dim(.s) });
+            mixed_qkv = mixed_qkv.slice(.s, .{ .start = mixed_qkv.dim(.s) - x.dim(.s), .end = mixed_qkv.dim(.s) });
         }
         mixed_qkv = mixed_qkv.withPartitioning(.model, .{ .s = .replicated, .mix = .model });
 
@@ -2262,10 +2262,10 @@ pub const GatedDeltaNet = struct {
             .forward(core_attn_out_normed.merge(.{ .d = .{ .vh, .vhd } }), core_attn_out_normed.dtype())
             .rename(.{ .dout = .d })
             .withPartitioning(.model, .{ .d = .replicated });
-        const updated_cache = cache.update(
-            if (use_cached_state) buildUpdatedConvState(conv_input, left_pad) else buildUpdatedConvStateFromPrefix(projected_qkv, left_pad, active_length),
-            last_recurrent_state,
-        );
+        const conv_state_start = active_length.convert(.i64)
+            .minimum(zml.Tensor.scalar(conv_input.dim(.s) - left_pad, .i64));
+        const updated_conv_state = conv_input.slice(.s, .dyn(conv_state_start, left_pad));
+        const updated_cache = cache.update(updated_conv_state, last_recurrent_state);
         return .{ output, updated_cache };
     }
 };

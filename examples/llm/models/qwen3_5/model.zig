@@ -8,6 +8,7 @@ const inference = @import("inference.zig");
 const q8_triton = @import("../../gguf/q8_triton.zig");
 const q4k_triton = @import("../../gguf/q4k_triton.zig");
 const q5k_triton = @import("../../gguf/q5k_triton.zig");
+const q6k_triton = @import("../../gguf/q6k_triton.zig");
 
 const log = std.log.scoped(.qwen3_5);
 
@@ -749,6 +750,92 @@ pub const QuantizedLinearQ5 = struct {
     }
 };
 
+pub const QuantizedLinearQ6 = struct {
+    ql0: zml.Tensor,
+    ql1: zml.Tensor,
+    qh: zml.Tensor,
+    sc1: zml.Tensor,
+    sc2: zml.Tensor,
+    sc3: zml.Tensor,
+    sc4: zml.Tensor,
+    d: zml.Tensor,
+    bias: ?zml.Tensor,
+    contraction_tag: zml.Shape.Tag,
+    output_tag: zml.Shape.Tag,
+    block_n: i64,
+
+    pub fn init(
+        store: zml.io.TensorStore.View,
+        tags: anytype,
+        mesh_: @EnumLiteral(),
+        partitioning: anytype,
+        bias_tags: anytype,
+        bias_mesh: @EnumLiteral(),
+        bias_partitioning: anytype,
+        comptime contraction_tag: anytype,
+    ) QuantizedLinearQ6 {
+        _ = tags;
+        const contraction: zml.Shape.Tag = zml.Shape.toTag(contraction_tag);
+        const is_d = comptime std.mem.eql(u8, @tagName(contraction_tag), "d");
+        const output: zml.Shape.Tag = if (is_d) zml.Shape.toTag(.dout) else zml.Shape.toTag(.d);
+        const output_partition = if (is_d) partitioning.dout else partitioning.d;
+        const part = .{ .n = output_partition, .kb = .replicated, .two = .replicated, .e32 = .replicated };
+        const part_sc = .{ .n = output_partition, .kb = .replicated, .two = .replicated, .e2 = .replicated };
+
+        const ql0 = store.createTensor("weight.q6.ql0", .{ .n, .kb, .two, .e32 }, mesh_, part);
+        const dout = ql0.dim(.n);
+        return .{
+            .ql0 = ql0,
+            .ql1 = store.createTensor("weight.q6.ql1", .{ .n, .kb, .two, .e32 }, mesh_, part),
+            .qh = store.createTensor("weight.q6.qh", .{ .n, .kb, .two, .e32 }, mesh_, part),
+            .sc1 = store.createTensor("weight.q6.sc1", .{ .n, .kb, .two, .e2 }, mesh_, part_sc),
+            .sc2 = store.createTensor("weight.q6.sc2", .{ .n, .kb, .two, .e2 }, mesh_, part_sc),
+            .sc3 = store.createTensor("weight.q6.sc3", .{ .n, .kb, .two, .e2 }, mesh_, part_sc),
+            .sc4 = store.createTensor("weight.q6.sc4", .{ .n, .kb, .two, .e2 }, mesh_, part_sc),
+            .d = store.createTensor("weight.q6.d", .{ .n, .kb }, mesh_, .{ .n = output_partition, .kb = .replicated }),
+            .bias = store.maybeCreateTensor("bias", bias_tags, bias_mesh, bias_partitioning),
+            .contraction_tag = contraction,
+            .output_tag = output,
+            .block_n = if (dout >= 64) 64 else 16,
+        };
+    }
+
+    pub fn forward(self: QuantizedLinearQ6, x: zml.Tensor, dtype: zml.DataType) zml.Tensor {
+        _ = dtype;
+        const x_shape = x.shape();
+        const d = x.dim(self.contraction_tag);
+        const m: i64 = @divExact(@as(i64, @intCast(x_shape.count())), d);
+        const x_flat = x.reshape(zml.Shape.init(.{ .m = m, .k = d }, x.dtype()));
+        const n = self.ql0.dim(.n);
+
+        const use_kernel = switch (zml.Compiler.current().platform.target) {
+            .rocm, .cuda => true,
+            else => false,
+        };
+
+        const out_padded = if (!use_kernel) blk: {
+            const w = q6GraphDequant(self.ql0, self.ql1, self.qh, self.sc1, self.sc2, self.sc3, self.sc4, self.d, n, d);
+            break :blk x_flat.dot(w, .k);
+        } else if (m == 1) blk: {
+            const x_row = x_flat.reshape(zml.Shape.init(.{ .k = d }, x.dtype()));
+            break :blk q6Matvec1(x_row, self.ql0, self.ql1, self.qh, self.sc1, self.sc2, self.sc3, self.sc4, self.d, self.block_n).reshape(zml.Shape.init(.{ .m = 1, .n = n }, .bf16));
+        } else blk: {
+            const m_padded = std.mem.alignForward(i64, m, 16);
+            const x_padded = if (m_padded == m) x_flat else blk2: {
+                const zeros = zml.Tensor.scalar(0, x.dtype()).broad(zml.Shape.init(.{ .m = m_padded - m, .k = d }, x.dtype()));
+                break :blk2 zml.Tensor.concatenate(&.{ x_flat, zeros }, .m);
+            };
+            break :blk q6Matvec(x_padded, self.ql0, self.ql1, self.qh, self.sc1, self.sc2, self.sc3, self.sc4, self.d, self.block_n);
+        };
+
+        const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
+        const out_shape = x_shape.setDim(self.contraction_tag, n);
+        var out = out_flat.reshape(out_shape).renameTag(self.contraction_tag, self.output_tag);
+        if (self.bias) |bias| out = out.add(bias.broad(out.shape()));
+        return out;
+    }
+};
+
 fn q8GraphDequant(quants: zml.Tensor, scales: zml.Tensor, n: i64, k: i64) zml.Tensor {
     const nb = @divExact(k, 32);
     const q = quants.reshape(zml.Shape.init(.{ .n = n, .nb = nb, .block = 32 }, .i8)).convert(.f32);
@@ -820,6 +907,62 @@ fn q5GraphDequant(
     const w_hi = d4.mul(sc_hi.broad(q.shape())).mul(hi.add(hi_hi)).sub(dmin4.mul(mn_hi.broad(q.shape())));
     const w = zml.Tensor.concatenate(&.{ w_lo, w_hi }, .e);
     return w.reshape(zml.Shape.init(.{ .n = n, .k = k }, .f32)).convert(.bf16);
+}
+
+fn q6GraphDequant(
+    ql0: zml.Tensor,
+    ql1: zml.Tensor,
+    qh: zml.Tensor,
+    sc1: zml.Tensor,
+    sc2: zml.Tensor,
+    sc3: zml.Tensor,
+    sc4: zml.Tensor,
+    d: zml.Tensor,
+    n: i64,
+    k: i64,
+) zml.Tensor {
+    const kb = @divExact(k, 256);
+    const qshape = zml.Shape.init(.{ .n = n, .kb = kb, .h = 2, .e = 32 }, .u8);
+    const ql0_3 = ql0.reshape(qshape);
+    const ql1_3 = ql1.reshape(qshape);
+    const qh_3 = qh.reshape(qshape);
+
+    const mask4 = zml.Tensor.scalar(0x0F, .u8).broad(qshape);
+    const lo0 = ql0_3.logical(.AND, mask4);
+    const lo1 = ql1_3.logical(.AND, mask4);
+    const hi0 = ql0_3.shiftRightLogical(zml.Tensor.scalar(4, .u8).broad(qshape)).logical(.AND, mask4);
+    const hi1 = ql1_3.shiftRightLogical(zml.Tensor.scalar(4, .u8).broad(qshape)).logical(.AND, mask4);
+
+    const q1 = sixBitGraph(qh_3, lo0, 0);
+    const q2 = sixBitGraph(qh_3, lo1, 2);
+    const q3 = sixBitGraph(qh_3, hi0, 4);
+    const q4 = sixBitGraph(qh_3, hi1, 6);
+
+    const scshape = zml.Shape.init(.{ .n = n, .kb = kb, .h = 2, .i = 2 }, .i8);
+    const w1 = scaleChunkGraph(q1, sc1.reshape(scshape), n, kb);
+    const w2 = scaleChunkGraph(q2, sc2.reshape(scshape), n, kb);
+    const w3 = scaleChunkGraph(q3, sc3.reshape(scshape), n, kb);
+    const w4 = scaleChunkGraph(q4, sc4.reshape(scshape), n, kb);
+
+    const w12 = zml.Tensor.concatenate(&.{ w1, w2 }, -1);
+    const w123 = zml.Tensor.concatenate(&.{ w12, w3 }, -1);
+    const w1234 = zml.Tensor.concatenate(&.{ w123, w4 }, -1);
+    const w = w1234.reshape(zml.Shape.init(.{ .n = n, .kb = kb, .k = 256 }, .f32));
+    const d4 = d.convert(.f32).reshape(zml.Shape.init(.{ .n = n, .kb = kb, .one = 1 }, .f32));
+    return w.mul(d4).reshape(zml.Shape.init(.{ .n = n, .k = k }, .f32)).convert(.bf16);
+}
+
+fn sixBitGraph(qh: zml.Tensor, lo: zml.Tensor, comptime shift: u8) zml.Tensor {
+    const bits = qh.shiftRightLogical(zml.Tensor.scalar(shift, .u8).broad(qh.shape()))
+        .logical(.AND, zml.Tensor.scalar(3, .u8).broad(qh.shape()));
+    const value = lo.logical(.OR, bits.shiftLeft(zml.Tensor.scalar(4, .u8).broad(qh.shape())));
+    return value.convert(.f32).subConstant(32);
+}
+
+fn scaleChunkGraph(q: zml.Tensor, sc: zml.Tensor, n: i64, kb: i64) zml.Tensor {
+    const q4 = q.reshape(zml.Shape.init(.{ .n = n, .kb = kb, .h = 2, .i = 2, .e = 16 }, .f32));
+    const s = sc.convert(.f32).reshape(zml.Shape.init(.{ .n = n, .kb = kb, .h = 2, .i = 2, .one = 1 }, .f32));
+    return q4.mul(s).reshape(zml.Shape.init(.{ .n = n, .kb = kb, .h = 2, .e = 32 }, .f32));
 }
 
 fn q8Matvec(x: zml.Tensor, quants: zml.Tensor, scales: zml.Tensor, block_n: i64) zml.Tensor {
@@ -997,13 +1140,67 @@ fn q5Matvec1(x: zml.Tensor, qs: zml.Tensor, qh: zml.Tensor, sc: zml.Tensor, mn: 
     ).out;
 }
 
+fn q6Matvec(x: zml.Tensor, ql0: zml.Tensor, ql1: zml.Tensor, qh: zml.Tensor, sc1: zml.Tensor, sc2: zml.Tensor, sc3: zml.Tensor, sc4: zml.Tensor, d: zml.Tensor, block_n: i64) zml.Tensor {
+    const m = x.dim(.m);
+    const k = x.dim(.k);
+    const n = ql0.dim(.n);
+    const kb = @divExact(k, 256);
+    const cfg: q6k_triton.Config = .{
+        .n = n,
+        .k = k,
+        .block_n = block_n,
+        .block_m = 16,
+        .stride_ql_n = @divExact(k, 4),
+        .stride_qh_n = @divExact(k, 4),
+        .stride_sc_n = @divExact(k, 64),
+        .stride_d_n = kb,
+    };
+    return q6k_triton.Q6KMatvec.call(
+        .{ .x_ptr = x, .ql0_ptr = ql0, .ql1_ptr = ql1, .qh_ptr = qh, .sc1_ptr = sc1, .sc2_ptr = sc2, .sc3_ptr = sc3, .sc4_ptr = sc4, .d_ptr = d },
+        .{ .out = zml.Shape.init(.{ .m = m, .n = n }, .bf16) },
+        .{
+            .cfg = cfg,
+            .grid = .{ @intCast(@divExact(m, 16)), @intCast(@divExact(n, block_n)), 1 },
+            .num_stages = 3,
+            .num_warps = 4,
+        },
+    ).out;
+}
+
+fn q6Matvec1(x: zml.Tensor, ql0: zml.Tensor, ql1: zml.Tensor, qh: zml.Tensor, sc1: zml.Tensor, sc2: zml.Tensor, sc3: zml.Tensor, sc4: zml.Tensor, d: zml.Tensor, block_n: i64) zml.Tensor {
+    const k = x.dim(.k);
+    const n = ql0.dim(.n);
+    const kb = @divExact(k, 256);
+    const cfg: q6k_triton.Config = .{
+        .n = n,
+        .k = k,
+        .block_n = block_n,
+        .block_m = 16,
+        .stride_ql_n = @divExact(k, 4),
+        .stride_qh_n = @divExact(k, 4),
+        .stride_sc_n = @divExact(k, 64),
+        .stride_d_n = kb,
+    };
+    return q6k_triton.Q6KMatvec1.call(
+        .{ .x_ptr = x, .ql0_ptr = ql0, .ql1_ptr = ql1, .qh_ptr = qh, .sc1_ptr = sc1, .sc2_ptr = sc2, .sc3_ptr = sc3, .sc4_ptr = sc4, .d_ptr = d },
+        .{ .out = zml.Shape.init(.{ .n = n }, .bf16) },
+        .{
+            .cfg = cfg,
+            .grid = .{ @intCast(@divExact(n, block_n)), 1, 1 },
+            .num_stages = 3,
+            .num_warps = 4,
+        },
+    ).out;
+}
+
 pub const LinearLike = union(enum) {
     bf16: zml.nn.Linear,
     q8: QuantizedLinearQ8,
     q4: QuantizedLinearQ4,
     q5: QuantizedLinearQ5,
+    q6: QuantizedLinearQ6,
 
-    pub const Scheme = enum { bf16, q8, q4, q5 };
+    pub const Scheme = enum { bf16, q8, q4, q5, q6 };
 
     pub fn scheme(self: LinearLike) Scheme {
         return switch (self) {
@@ -1011,6 +1208,7 @@ pub const LinearLike = union(enum) {
             .q8 => .q8,
             .q4 => .q4,
             .q5 => .q5,
+            .q6 => .q6,
         };
     }
 
@@ -1024,6 +1222,9 @@ pub const LinearLike = union(enum) {
         bias_partitioning: anytype,
         comptime contraction_tag: anytype,
     ) LinearLike {
+        if (store.getShape("weight.q6.ql0") != null) {
+            return .{ .q6 = QuantizedLinearQ6.init(store, tags, mesh_, partitioning, bias_tags, bias_mesh, bias_partitioning, contraction_tag) };
+        }
         if (store.getShape("weight.q5.qs") != null) {
             return .{ .q5 = QuantizedLinearQ5.init(store, tags, mesh_, partitioning, bias_tags, bias_mesh, bias_partitioning, contraction_tag) };
         }
@@ -1046,6 +1247,7 @@ pub const LinearLike = union(enum) {
             .q8 => |linear| linear.forward(x, dtype),
             .q4 => |linear| linear.forward(x, dtype),
             .q5 => |linear| linear.forward(x, dtype),
+            .q6 => |linear| linear.forward(x, dtype),
         };
     }
 
@@ -1055,6 +1257,7 @@ pub const LinearLike = union(enum) {
             .q8 => |*linear| zml.Buffer.deinitAll(QuantizedLinearQ8, linear),
             .q4 => |*linear| zml.Buffer.deinitAll(QuantizedLinearQ4, linear),
             .q5 => |*linear| zml.Buffer.deinitAll(QuantizedLinearQ5, linear),
+            .q6 => |*linear| zml.Buffer.deinitAll(QuantizedLinearQ6, linear),
         }
     }
 };

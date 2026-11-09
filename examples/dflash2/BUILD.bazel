@@ -1,0 +1,23 @@
+load("@rules_zig//zig:defs.bzl", "zig_binary", "zig_library")
+
+zig_library(
+    name = "dflash2_model",
+    srcs = ["common.zig"],
+    main = "dflash2_model.zig",
+    visibility = ["//visibility:public"],
+    deps = ["//zml"],
+)
+
+zig_binary(
+    name = "dflash2",
+    srcs = [
+        "common.zig",
+        "dflash2_model.zig",
+        "gguf.zig",
+        "gguf/quants.zig",
+        "main.zig",
+    ],
+    main = "main.zig",
+    visibility = ["//visibility:public"],
+    deps = ["//zml"],
+)

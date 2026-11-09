@@ -5,6 +5,7 @@ const zml = @import("zml");
 const stdx = zml.stdx;
 
 const chat = @import("chat.zig");
+const gguf = @import("gguf.zig");
 const models = @import("models.zig");
 
 pub const std_options: std.Options = .{
@@ -24,10 +25,11 @@ const Args = struct {
     pub const help =
         \\ Use llm --model=<path> [options]
         \\
-        \\ Run text generation with a model selected from `model_type` in the `config.json`.
+        \\ Run text generation with a model selected from `model_type` in the `config.json`,
+        \\ or directly from a `.gguf` file.
         \\
         \\ Options:
-        \\   --model=<path>      Path to the model repository (required)
+        \\   --model=<path>      Path to the model repository or `.gguf` file (required)
         \\   --prompt=<string>   Prompt to use for generation (default: none)
         \\   --seqlen=<number>   Sequence length (default: 2048)
         \\   --topk=<number>     Top-k sampling cutoff (default: 4)
@@ -98,11 +100,25 @@ pub fn main(init: std.process.Init) !void {
     // Model initialization
     //
     log.info("Resolving model repository..", .{});
-    const repo = try zml.safetensors.resolveModelRepo(io, args.model);
+    const is_gguf = std.mem.endsWith(u8, args.model, ".gguf");
+
+    var gguf_context: ?gguf.Context = null;
+    defer if (gguf_context) |*context| context.deinit();
+
+    const repo = if (is_gguf) blk: {
+        // GGUF files are memory-mapped, so use the real Io rather than the VFS.
+        gguf_context = try .init(allocator, init.io, args.model);
+        const cache_dir = try gguf_context.?.ensureCacheDir(allocator, init.io, init.environ_map);
+        defer allocator.free(cache_dir);
+        break :blk try std.Io.Dir.openDirAbsolute(io, cache_dir, .{});
+    } else try zml.safetensors.resolveModelRepo(io, args.model);
     defer repo.close(io);
 
     log.info("Initializing model..", .{});
-    var registry: zml.safetensors.TensorRegistry = try .fromRepo(allocator, io, repo);
+    var registry: zml.safetensors.TensorRegistry = if (is_gguf)
+        try gguf_context.?.registry(allocator)
+    else
+        try .fromRepo(allocator, io, repo);
     defer registry.deinit();
 
     // Defines how the model's tensors are sharded across the available devices.
@@ -142,7 +158,7 @@ pub fn main(init: std.process.Init) !void {
     //
     // We're ready to go! Let's start a chat...
     //
-    try printZmlLogo(io, init.environ_map);
+    try printZmlLogo(init.io, init.environ_map);
 
     const interactive = args.prompt == null;
     const prompt = if (args.prompt) |prompt_arg| b: {
@@ -158,7 +174,7 @@ pub fn main(init: std.process.Init) !void {
 
     var llm_chat = try chat.Chat.init(
         allocator,
-        io,
+        init.io,
         platform,
         tokenizer,
         compiled_model,

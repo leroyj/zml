@@ -151,7 +151,7 @@ pub const Session = struct {
 
         generation: while (true) {
             const token_id = self.generated_token_slice.items(u32)[0];
-            if (token_id == self.eos_token_id) break :generation;
+            if (token_id == self.eos_token_id or token_id == self.special_tokens.im_end_token_id) break :generation;
 
             const token = try decoder.feedOne(token_id, out_tokens_buffer);
             if (self.think_start) |think_start| if (token_id == think_start) {

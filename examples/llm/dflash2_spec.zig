@@ -142,6 +142,36 @@ pub fn main(init: std.process.Init) !void {
     }, .{ .meshes = &meshes.all() });
     defer verify_exe.deinit();
 
+    log.info("Compiling state commit...", .{});
+    const text_cfg = target_config.text_config;
+    var num_linear: i64 = 0;
+    for (text_cfg.layer_types) |layer_type| {
+        if (layer_type == .linear_attention) num_linear += 1;
+    }
+    const conv_dim: i64 = 2 * @as(i64, @intCast(text_cfg.linear_num_key_heads)) * @as(i64, @intCast(text_cfg.linear_key_head_dim)) +
+        @as(i64, @intCast(text_cfg.linear_num_value_heads)) * @as(i64, @intCast(text_cfg.linear_value_head_dim));
+    const stacked_shape = zml.Shape.init(.{
+        .layer = num_linear,
+        .s = @as(i64, block),
+        .b = 1,
+        .vh = @as(i64, @intCast(text_cfg.linear_num_value_heads)),
+        .vhd = @as(i64, @intCast(text_cfg.linear_value_head_dim)),
+        .khd = @as(i64, @intCast(text_cfg.linear_key_head_dim)),
+    }, .f32);
+    const conv_feats_shape = zml.Shape.init(.{
+        .b = 1,
+        .layer = num_linear,
+        .s = @as(i64, block) + @as(i64, @intCast(text_cfg.linear_conv_kernel_dim)) - 1,
+        .mix = conv_dim,
+    }, cache_dtype);
+    var commit_exe = try platform.compileFn(allocator, io, qwen3_5.commitSpeculativeState, .{
+        target_kv_cache.gated_delta_net,
+        zml.Tensor.fromShape(stacked_shape),
+        zml.Tensor.fromShape(conv_feats_shape),
+        zml.Tensor.init(.{}, .u32),
+    }, .{ .meshes = &meshes.all() });
+    defer commit_exe.deinit();
+
     log.info("Compiling draft prefill...", .{});
     var draft_prefill_exe = try platform.compileFn(allocator, io, draftStep, .{
         draft_model,
@@ -280,7 +310,7 @@ pub fn main(init: std.process.Init) !void {
         defer noise_buf.deinit();
 
         const is_prefill_draft = step == 0;
-        const ctx_len: u32 = if (is_prefill_draft) @intCast(prefill_len) else context_len;
+        const ctx_len: u32 = if (is_prefill_draft) @intCast(prefill_len) else block;
         const pos_len: u32 = ctx_len + block;
         var pos_data = try allocator.alloc(u32, @intCast(pos_len));
         defer allocator.free(pos_data);
@@ -354,15 +384,17 @@ pub fn main(init: std.process.Init) !void {
         verify_args.set(.{ target_buffers, drafted_buf, drafted_buf, token_index_buf, verify_active_len_buf, target_kv_buffers, rng_buf });
         verify_exe.call(io, verify_args, &verify_results, .{ .wait = true });
 
-        const block_hidden, var valid_buf, var correction_buf, var updated_kv, var rng_after = verify_results.get(struct {
+        const block_hidden, var valid_buf, var correction_buf, const kv_after, var stacked_buf, var conv_feats_buf, var rng_after = verify_results.get(struct {
             zml.Buffer,
             zml.Buffer,
             zml.Buffer,
             zml.Bufferized(qwen3_5.KvCache),
+            zml.Buffer,
+            zml.Buffer,
             zml.Tensor.Rng.Buffer,
         });
-        replaceKvBuffers(&target_kv_buffers, &updated_kv);
-        replaceBuffer(&rng_buf._state, &rng_after._state);
+        defer stacked_buf.deinit();
+        defer conv_feats_buf.deinit();
 
         var valid_slice = try valid_buf.toSliceAlloc(allocator, io);
         defer valid_slice.free(allocator);
@@ -373,6 +405,23 @@ pub fn main(init: std.process.Init) !void {
         valid_buf.deinit();
         correction_buf.deinit();
 
+        // Roll the recurrent/conv state forward to the accepted prefix.
+        var valid_scalar_buf = try zml.Buffer.scalar(io, platform, valid, .u32);
+        defer valid_scalar_buf.deinit();
+        var commit_args = try commit_exe.args(allocator);
+        defer commit_args.deinit(allocator);
+        var commit_results = try commit_exe.results(allocator);
+        defer commit_results.deinit(allocator);
+        commit_args.set(.{ kv_after.gated_delta_net, stacked_buf, conv_feats_buf, valid_scalar_buf });
+        commit_exe.call(io, commit_args, &commit_results, .{ .wait = true });
+        const committed_gdn = commit_results.get(zml.Bufferized(qwen3_5.KvCache.GatedDeltaNetCache));
+
+        var next_kv = kv_after;
+        next_kv.gated_delta_net = committed_gdn;
+        replaceKvBuffers(&target_kv_buffers, &next_kv);
+        replaceBuffer(&rng_buf._state, &rng_after._state);
+
+        const step_start = start;
         for (0..valid) |i| {
             if (start >= args.max_seq_len) break;
             try generated.append(allocator, block_tokens[i + 1]);
@@ -387,8 +436,8 @@ pub fn main(init: std.process.Init) !void {
         if (owns_context) context_hidden.deinit();
         context_hidden = block_hidden;
         owns_context = true;
-        context_len = block;
-        draft_cache_index = start -| block;
+        context_len = valid + 1;
+        draft_cache_index = step_start;
 
         log.info("step {d}: valid={d} start={d}", .{ step, valid, start });
     }

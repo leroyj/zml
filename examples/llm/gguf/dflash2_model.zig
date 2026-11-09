@@ -378,8 +378,8 @@ pub const DFlashAttention = struct {
         }, .s).splitAxis(-1, .{ .h = self.num_kv_heads, .hd = .auto });
 
         var new_v = zml.Tensor.concatenate(&.{
-            linearForwardF32(self.v_proj, target_hidden),
-            linearForwardF32(self.v_proj, hidden_states),
+            self.v_proj.forward(target_hidden, target_hidden.dtype()),
+            self.v_proj.forward(hidden_states, hidden_states.dtype()),
         }, .s).splitAxis(-1, .{ .h = self.num_kv_heads, .hd = .auto });
 
         q = self.q_norm.forward(q.rename(.{ .hd = .d })).rename(.{ .d = .hd });
@@ -578,29 +578,30 @@ fn unloadLinear(linear_: anytype) void {
     linear_.weight.deinit();
 }
 
-fn linearForwardF32(linear_: zml.nn.Linear, x: zml.Tensor) zml.Tensor {
-    var y = x.convert(.f32).dot(linear_.weight.convert(.f32), linear_.tag);
-    return if (linear_.bias) |bias| y.add(bias.convert(.f32).broad(y.shape())) else y;
-}
-
 fn updateBucketed(kv: KvCache, new_k: zml.Tensor, new_v: zml.Tensor, token_index: zml.Tensor, active_context_len: zml.Tensor, context_len: i64) KvCache {
-    _ = active_context_len;
-    _ = context_len;
-    const layer_idx: i64 = @intCast(kv.layer_index orelse @panic("forgot to call atLayer"));
-    const layer_slice = kv.kv.slice(.layer, .{ .start = layer_idx, .end = layer_idx + 1 }).squeeze(.layer);
-    const new_kv = zml.Tensor.stack(&.{
-        new_k.convert(kv.kv.dtype()),
-        new_v.convert(kv.kv.dtype()),
-    }, .k, .kv);
-    const updated = layer_slice.dynamicUpdateSlice(.{ .k = token_index, .kv = zml.Tensor.scalar(0, .u32), .h = zml.Tensor.scalar(0, .u32), .hd = zml.Tensor.scalar(0, .u32) }, new_kv);
-    return .{
-        .kv = kv.kv.scatterSlices(
-            .{ .layer = zml.Tensor.scalar(layer_idx, .u32) },
-            updated.transpose(kv.kv.shape().drop(.layer)),
-            .{ .indices_are_sorted = true, .update_fn = zml.Tensor.ScatterOpts.override },
-        ).reuseBuffer(kv.kv),
-        .layer_index = kv.layer_index,
-    };
+    // Merge the new block into the cached window the way DFlash expects it:
+    // the context K/V overwrite slots [0, context_len) so the first
+    // `active_context_len` entries hold the committed tokens, and the proposal
+    // K/V land at [active_context_len, +block) so the attention mask
+    // `k < cache_index + active_context_len + block` covers exactly the
+    // committed context plus the new block.
+    const proposal_len = new_k.dim(.k) - context_len;
+    const merged_len = context_len + proposal_len;
+    const context_start = zml.Tensor.scalar(@as(u32, 0), .u32);
+    const proposal_start = active_context_len.convert(.u32);
+
+    const context_k = new_k.slice(.k, .{ .start = 0, .end = context_len });
+    const context_v = new_v.slice(.k, .{ .start = 0, .end = context_len });
+    const proposal_k = new_k.slice(.k, .{ .start = context_len, .end = new_k.dim(.k) });
+    const proposal_v = new_v.slice(.k, .{ .start = context_len, .end = new_v.dim(.k) });
+
+    var merged_k = kv.keys().slice(.k, .dyn(token_index.convert(.i64), merged_len)).convert(new_k.dtype());
+    var merged_v = kv.values().slice(.k, .dyn(token_index.convert(.i64), merged_len)).convert(new_v.dtype());
+    merged_k = merged_k.dynamicUpdateSlice(.{ .k = context_start }, context_k);
+    merged_v = merged_v.dynamicUpdateSlice(.{ .k = context_start }, context_v);
+    merged_k = merged_k.dynamicUpdateSlice(.{ .k = proposal_start }, proposal_k);
+    merged_v = merged_v.dynamicUpdateSlice(.{ .k = proposal_start }, proposal_v);
+    return kv.update(merged_k, merged_v, token_index);
 }
 
 fn zeroBuffer(

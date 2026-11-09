@@ -137,10 +137,11 @@ pub const LoadedModel = struct {
 pub const Buffers = zml.Bufferized(Model);
 
 fn sampleLogits(logits_: zml.Tensor, sampling: zml.nn.SamplingStrategy, rng: zml.Tensor.Rng) struct { zml.Tensor, zml.Tensor.Rng } {
-    const logits = logits_.withPartialTags(.{.voc});
-    const temperature: f32 = if (sampling.temperature < 0.00001) 1.0 else sampling.temperature;
-    const topk: u32 = if (sampling.temperature < 0.00001) 1 else @intCast(logits.dim(.voc));
-    const tokens, const updated_rng = zml.nn.sampleTokens(logits, .{ .topk = topk, .temperature = temperature }, rng);
+    // Use the caller's strategy as-is: `topk = 1` (greedy) must stay greedy here.
+    // The previous version treated `temperature < eps` as the greedy switch and
+    // otherwise sampled over the whole vocabulary, which turned every speculative
+    // correction into a temperature-1.0 random sample.
+    const tokens, const updated_rng = zml.nn.sampleTokens(logits_.withPartialTags(.{.voc}), sampling, rng);
     return .{ tokens.convert(.u32), updated_rng };
 }
 
@@ -287,6 +288,7 @@ pub const Model = struct {
             active_length,
             kv_cache,
             target_layer_ids,
+            false,
         );
         const last = hidden.slice(.s, .dyn(active_length.convert(.i32).addConstant(-1), 1));
         const logits = self.sampler().logitsAll(last);
@@ -303,9 +305,9 @@ pub const Model = struct {
         kv_cache: KvCache,
         target_layer_ids: []const u32,
         rng: zml.Tensor.Rng,
-    ) struct { zml.Tensor, zml.Tensor, zml.Tensor, KvCache, zml.Tensor.Rng } {
+    ) struct { zml.Tensor, zml.Tensor, zml.Tensor, KvCache, zml.Tensor, zml.Tensor, zml.Tensor.Rng } {
         const tokens_ = tokens.withPartialTags(.{.s});
-        const target_hidden, const hidden, const updated_kv_cache = self.text_model.forwardWithTaps(
+        const target_hidden, const hidden, const updated_kv_cache, const stacked_states, const conv_feats = self.text_model.forwardWithTapsSpec(
             tokens_,
             token_index,
             active_length,
@@ -319,7 +321,7 @@ pub const Model = struct {
             self.gen_options.sampling_strategy,
             rng,
         );
-        return .{ target_hidden, valid_draft_tokens, correction_token, updated_kv_cache, updated_rng };
+        return .{ target_hidden, valid_draft_tokens, correction_token, updated_kv_cache, stacked_states, conv_feats, updated_rng };
     }
 
     pub fn sampler(self: Model) Sampler {
@@ -458,6 +460,7 @@ pub const TextModel = struct {
         active_length: zml.Tensor,
         kv_cache: KvCache,
         target_layer_ids: []const u32,
+        use_prior_state: bool,
     ) struct { zml.Tensor, zml.Tensor, KvCache } {
         var hidden_states = EmbedTokens.forward(.{
             .embedding = .{ .embed_tokens = self.embed_tokens },
@@ -468,7 +471,7 @@ pub const TextModel = struct {
         var selected: [16]zml.Tensor = undefined;
         var selected_len: usize = 0;
         for (self.layers, 0..) |layer, i| {
-            hidden_states, updated_kv_cache = layer.forward(hidden_states, token_index, active_length, updated_kv_cache.atLayer(i));
+            hidden_states, updated_kv_cache = layer.forwardWithCache(hidden_states, token_index, active_length, updated_kv_cache.atLayer(i), use_prior_state);
             for (target_layer_ids) |target| {
                 if (target == i) {
                     selected[selected_len] = hidden_states;
@@ -480,6 +483,53 @@ pub const TextModel = struct {
 
         const target_hidden = zml.Tensor.concatenate(selected[0..selected_len], .d).squeeze(.b);
         return .{ target_hidden, hidden_states, updated_kv_cache.reuseBuffer(kv_cache) };
+    }
+
+    /// Speculative variant of `forwardWithTaps`: the GatedDeltaNet layers do
+    /// not update the cache; instead they return their per-step recurrent
+    /// states and conv features so the caller can roll the cache back to the
+    /// accepted prefix with `commitSpeculativeState`.
+    pub fn forwardWithTapsSpec(
+        self: TextModel,
+        tokens: zml.Tensor,
+        token_index: zml.Tensor,
+        active_length: zml.Tensor,
+        kv_cache: KvCache,
+        target_layer_ids: []const u32,
+    ) struct { zml.Tensor, zml.Tensor, KvCache, zml.Tensor, zml.Tensor } {
+        var hidden_states = EmbedTokens.forward(.{
+            .embedding = .{ .embed_tokens = self.embed_tokens },
+            .tokens = tokens,
+        }).hidden;
+
+        var updated_kv_cache = kv_cache;
+        var selected: [16]zml.Tensor = undefined;
+        var selected_len: usize = 0;
+        var stacked_list: [64]zml.Tensor = undefined;
+        var conv_list: [64]zml.Tensor = undefined;
+        var stacked_len: usize = 0;
+        for (self.layers, 0..) |layer, i| {
+            const result = layer.forwardSpec(hidden_states, token_index, active_length, updated_kv_cache.atLayer(i));
+            hidden_states = result.hidden;
+            updated_kv_cache = result.cache;
+            if (result.stacked) |stacked| {
+                stacked_list[stacked_len] = stacked;
+                conv_list[stacked_len] = result.conv_feats.?;
+                stacked_len += 1;
+            }
+            for (target_layer_ids) |target| {
+                if (target == i) {
+                    selected[selected_len] = hidden_states;
+                    selected_len += 1;
+                    break;
+                }
+            }
+        }
+
+        const target_hidden = zml.Tensor.concatenate(selected[0..selected_len], .d).squeeze(.b);
+        const stacked = zml.Tensor.stack(stacked_list[0..stacked_len], 0, .layer);
+        const conv_feats = zml.Tensor.stack(conv_list[0..stacked_len], 1, .layer);
+        return .{ target_hidden, hidden_states, updated_kv_cache.reuseBuffer(kv_cache), stacked, conv_feats };
     }
 };
 
@@ -562,6 +612,17 @@ pub const TransformerLayer = struct {
         active_length: zml.Tensor,
         kv_cache: KvCache.LayerView,
     ) struct { zml.Tensor, KvCache } {
+        return self.forwardWithCache(x0, token_index, active_length, kv_cache, x0.dim(.s) == 1);
+    }
+
+    pub fn forwardWithCache(
+        self: TransformerLayer,
+        x0: zml.Tensor,
+        token_index: zml.Tensor,
+        active_length: zml.Tensor,
+        kv_cache: KvCache.LayerView,
+        use_prior_state: bool,
+    ) struct { zml.Tensor, KvCache } {
         const x0_replicated = x0.withPartitioning(.model, .{ .d = .replicated });
         const normalized_x0 = self.input_layernorm.forward(x0_replicated);
 
@@ -582,7 +643,7 @@ pub const TransformerLayer = struct {
                     .linear_attn => |cache| cache,
                     .self_attn => unreachable,
                 };
-                const result = linear_attn.forward(normalized_x0, cache, active_length);
+                const result = linear_attn.forwardWithCache(normalized_x0, cache, active_length, use_prior_state);
                 attention_output = result[0];
                 updated_kv_cache.gated_delta_net = result[1].reuseBuffer(updated_kv_cache.gated_delta_net);
             },
@@ -594,6 +655,66 @@ pub const TransformerLayer = struct {
         const mlp_output = self.mlp.forward(normalized_hidden).withPartitioning(.model, .{ .d = .replicated });
 
         return .{ mlp_output.add(x1).withPartitioning(.model, .{ .d = .replicated }).reuseBuffer(x0), updated_kv_cache };
+    }
+
+    pub const SpecOutput = struct {
+        hidden: zml.Tensor,
+        cache: KvCache,
+        stacked: ?zml.Tensor = null,
+        conv_feats: ?zml.Tensor = null,
+    };
+
+    /// Speculative variant: full-attention layers update the KV cache as
+    /// usual (later blocks overwrite any rejected entries), while
+    /// GatedDeltaNet layers leave the cache untouched and report their
+    /// per-step states for a later rollback.
+    pub fn forwardSpec(
+        self: TransformerLayer,
+        x0: zml.Tensor,
+        token_index: zml.Tensor,
+        active_length: zml.Tensor,
+        kv_cache: KvCache.LayerView,
+    ) SpecOutput {
+        const x0_replicated = x0.withPartitioning(.model, .{ .d = .replicated });
+        const normalized_x0 = self.input_layernorm.forward(x0_replicated);
+
+        var attention_output: zml.Tensor = undefined;
+        var updated_kv_cache: KvCache = kv_cache.parent;
+        var stacked: ?zml.Tensor = null;
+        var conv_feats: ?zml.Tensor = null;
+        switch (self.attn) {
+            .full_attention => |*self_attn| {
+                const cache = switch (kv_cache.cache) {
+                    .self_attn => |cache| cache,
+                    .linear_attn => unreachable,
+                };
+                const result = self_attn.forward(normalized_x0, token_index, cache);
+                attention_output = result[0];
+                updated_kv_cache.self_attn = result[1].reuseBuffer(updated_kv_cache.self_attn);
+            },
+            .linear_attention => |*linear_attn| {
+                const cache = switch (kv_cache.cache) {
+                    .linear_attn => |cache| cache,
+                    .self_attn => unreachable,
+                };
+                const result = linear_attn.forwardSpeculative(normalized_x0, cache, active_length);
+                attention_output = result[0];
+                stacked = result[1];
+                conv_feats = result[2];
+            },
+        }
+
+        const x1 = attention_output.add(x0_replicated).withPartitioning(.model, .{ .d = .replicated });
+        const normalized_hidden = self.post_attention_layernorm.forward(x1);
+
+        const mlp_output = self.mlp.forward(normalized_hidden).withPartitioning(.model, .{ .d = .replicated });
+
+        return .{
+            .hidden = mlp_output.add(x1).withPartitioning(.model, .{ .d = .replicated }).reuseBuffer(x0),
+            .cache = updated_kv_cache,
+            .stacked = stacked,
+            .conv_feats = conv_feats,
+        };
     }
 
     pub fn forwardSelfAttn(input: SelfAttnInput) SelfAttnOutput {
@@ -2030,6 +2151,61 @@ pub const TextRotaryEmbedding = struct {
     }
 };
 
+/// Gated-delta recurrence that additionally snapshots the recurrent state at
+/// every step of the block, so a speculative verification can roll the state
+/// back to the accepted prefix.
+const GdnCapture = struct {
+    queries: zml.Tensor,
+    keys: zml.Tensor,
+    values: zml.Tensor,
+    alphas: zml.Tensor,
+    betas: zml.Tensor,
+    active_length: zml.Tensor,
+
+    pub const State = struct {
+        step: zml.Tensor,
+        s: zml.Tensor,
+        outputs: zml.Tensor,
+        stacked: zml.Tensor,
+    };
+
+    pub fn cond(gdn: GdnCapture, state: State) zml.Tensor {
+        const active_length = gdn.active_length
+            .convert(.i32)
+            .maximum(zml.Tensor.scalar(0, .i32))
+            .minimum(zml.Tensor.scalar(gdn.queries.dim(.s), .i32));
+        return state.step.cmp(.LT, active_length);
+    }
+
+    pub fn sliceStep(input: zml.Tensor, step_: zml.Tensor) zml.Tensor {
+        return input.slice(.s, .dynSingle(step_));
+    }
+
+    pub fn body(gdn: GdnCapture, state: State) State {
+        const q = sliceStep(gdn.queries, state.step);
+        const k = sliceStep(gdn.keys, state.step);
+        const v = sliceStep(gdn.values, state.step);
+        const alpha = sliceStep(gdn.alphas, state.step);
+        const beta = sliceStep(gdn.betas, state.step);
+
+        const hvk = state.s.shape();
+        const hv = hvk.drop(.k);
+
+        const v_hat = state.s.dot(k, .k).mul(alpha.broad(hv));
+        const delta = v.sub(v_hat).mul(beta.broad(hv));
+        const delta_k = delta.broad(hvk).mul(k.broad(hvk));
+        const s_new = state.s.mul(alpha.broad(hvk)).add(delta_k);
+        const y = s_new.dot(q, .k);
+
+        return .{
+            .s = s_new,
+            .outputs = state.outputs.dynamicUpdateSlice(.{ .s = state.step }, y),
+            .stacked = state.stacked.dynamicUpdateSlice(.{ .s = state.step }, s_new),
+            .step = state.step.addConstant(1),
+        };
+    }
+};
+
 pub const GatedDeltaNet = struct {
     in_proj_qkv: LinearLike,
     in_proj_z: LinearLike,
@@ -2153,6 +2329,62 @@ pub const GatedDeltaNet = struct {
         };
     }
 
+    /// Same as `recurrentGatedDeltaRule`, but also returns the recurrent state
+    /// after every block position: `stacked[j]` is the state that has consumed
+    /// block positions 0..j.
+    fn recurrentGatedDeltaRuleStacked(
+        query: zml.Tensor,
+        key: zml.Tensor,
+        value: zml.Tensor,
+        g: zml.Tensor,
+        beta: zml.Tensor,
+        initial_state: zml.Tensor,
+        active_length: zml.Tensor,
+    ) struct { zml.Tensor, zml.Tensor } {
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(query.dim(.khd))));
+        const query_norm = zml.nn.normalizeL2(query.rename(.{ .kh = .vh }), 1e-6);
+        const key_norm = zml.nn.normalizeL2(key.rename(.{ .kh = .vh }), 1e-6);
+
+        const query_f32, const key_f32, const value_f32, const alpha_f32, const beta_f32 = .{
+            query_norm.convert(.f32).scale(scale).rename(.{ .vh = .h, .khd = .k }),
+            key_norm.convert(.f32).rename(.{ .vh = .h, .khd = .k }),
+            value.convert(.f32).rename(.{ .vh = .h, .vhd = .v }),
+            g.convert(.f32).exp().rename(.{ .vh = .h }),
+            beta.convert(.f32).rename(.{ .vh = .h }),
+        };
+
+        const initial_recurrent_state = initial_state
+            .convert(.f32)
+            .transpose(.{ .b, .vh, .vhd, .khd })
+            .rename(.{ .vh = .h, .vhd = .v, .khd = .k });
+
+        const gdn: GdnCapture = .{
+            .queries = query_f32,
+            .keys = key_f32,
+            .values = value_f32,
+            .alphas = alpha_f32,
+            .betas = beta_f32,
+            .active_length = active_length,
+        };
+        const state: GdnCapture.State = .{
+            .step = zml.Tensor.scalar(0, .i32),
+            .s = initial_recurrent_state,
+            .outputs = zml.Tensor.zeroes(value_f32.shape()),
+            .stacked = zml.Tensor.zeroes(zml.Shape.init(.{
+                .s = query_f32.dim(.s),
+                .b = value_f32.dim(.b),
+                .h = value_f32.dim(.h),
+                .v = value_f32.dim(.v),
+                .k = query_f32.dim(.k),
+            }, .f32)),
+        };
+        const final_state = zml.ops.@"while"(GdnCapture, gdn, state);
+        return .{
+            final_state.outputs.rename(.{ .h = .vh, .v = .vhd }).convert(query.dtype()),
+            final_state.stacked.rename(.{ .h = .vh, .v = .vhd, .k = .khd }),
+        };
+    }
+
     fn buildUpdatedConvState(input: zml.Tensor, left_pad: i64) zml.Tensor {
         const copy_len = @min(input.dim(.s), left_pad);
         const tail = input.slice(.s, .{ .start = input.dim(.s) - copy_len, .end = input.dim(.s) });
@@ -2170,6 +2402,10 @@ pub const GatedDeltaNet = struct {
     }
 
     pub fn forward(self: GatedDeltaNet, x: zml.Tensor, cache: KvCache.GatedDeltaNetCache, active_length: zml.Tensor) struct { zml.Tensor, KvCache.GatedDeltaNetCache } {
+        return self.forwardWithCache(x, cache, active_length, x.dim(.s) == 1);
+    }
+
+    pub fn forwardWithCache(self: GatedDeltaNet, x: zml.Tensor, cache: KvCache.GatedDeltaNetCache, active_length: zml.Tensor, use_prior_state: bool) struct { zml.Tensor, KvCache.GatedDeltaNetCache } {
         const key_dim = self.num_k_heads * self.head_k_dim;
         const value_dim = self.num_v_heads * self.head_v_dim;
         const conv_dim = 2 * key_dim + value_dim;
@@ -2179,7 +2415,7 @@ pub const GatedDeltaNet = struct {
         const projected_qkv = self.in_proj_qkv.forward(x_in, x_in.dtype())
             .rename(.{ .dout = .mix })
             .withPartitioning(.model, .{ .s = .replicated, .mix = .model });
-        const use_cached_state = left_pad > 0;
+        const use_cached_state = use_prior_state and left_pad > 0;
         const conv_input = b: {
             if (use_cached_state) break :b zml.Tensor.concatenate(&.{ cache.convState(), projected_qkv }, .s);
             break :b projected_qkv;
@@ -2262,13 +2498,140 @@ pub const GatedDeltaNet = struct {
             .forward(core_attn_out_normed.merge(.{ .d = .{ .vh, .vhd } }), core_attn_out_normed.dtype())
             .rename(.{ .dout = .d })
             .withPartitioning(.model, .{ .d = .replicated });
-        const conv_state_start = active_length.convert(.i64)
-            .minimum(zml.Tensor.scalar(conv_input.dim(.s) - left_pad, .i64));
-        const updated_conv_state = conv_input.slice(.s, .dyn(conv_state_start, left_pad));
+        const updated_conv_state = if (use_cached_state)
+            conv_input.slice(.s, .{ .start = conv_input.dim(.s) - left_pad, .end = conv_input.dim(.s) })
+        else
+            buildUpdatedConvStateFromPrefix(projected_qkv, left_pad, active_length);
         const updated_cache = cache.update(updated_conv_state, last_recurrent_state);
         return .{ output, updated_cache };
     }
+
+    /// Speculative variant of `forwardWithCache`: always continues from the
+    /// cached conv/recurrent state, runs the recurrence with per-step state
+    /// snapshots, and leaves the cache untouched. Returns the block output,
+    /// the stacked per-step recurrent states and the conv input features
+    /// (`[cached conv state, block]`), for `commitSpeculativeState`.
+    pub fn forwardSpeculative(
+        self: GatedDeltaNet,
+        x: zml.Tensor,
+        cache: KvCache.GatedDeltaNetCache,
+        active_length: zml.Tensor,
+    ) struct { zml.Tensor, zml.Tensor, zml.Tensor } {
+        const key_dim = self.num_k_heads * self.head_k_dim;
+        const value_dim = self.num_v_heads * self.head_v_dim;
+        const conv_dim = 2 * key_dim + value_dim;
+        const left_pad = self.conv_kernel_size - 1;
+
+        const x_in = x.withPartitioning(.model, .{ .d = .replicated });
+        const projected_qkv = self.in_proj_qkv.forward(x_in, x_in.dtype())
+            .rename(.{ .dout = .mix })
+            .withPartitioning(.model, .{ .s = .replicated, .mix = .model });
+
+        const conv_input = zml.Tensor.concatenate(&.{ cache.convState(), projected_qkv }, .s);
+
+        const kernel = self.conv1d_weight;
+        var mixed_qkv = zml.Tensor.conv1d(
+            conv_input,
+            kernel,
+            .{
+                .padding = &.{ left_pad, 0 },
+                .input_batch_dimension = 0,
+                .input_feature_dimension = 2,
+                .input_spatial_dimensions = 1,
+                .kernel_output_feature_dimension = 0,
+                .kernel_input_feature_dimension = 1,
+                .kernel_spatial_dimensions = 2,
+                .output_batch_dimension = 0,
+                .output_feature_dimension = 2,
+                .output_spatial_dimensions = 1,
+                .feature_group_count = conv_dim,
+            },
+        )
+            .silu();
+
+        mixed_qkv = mixed_qkv.slice(.s, .{ .start = mixed_qkv.dim(.s) - x.dim(.s), .end = mixed_qkv.dim(.s) });
+        mixed_qkv = mixed_qkv.withPartitioning(.model, .{ .s = .replicated, .mix = .model });
+
+        const z = self.in_proj_z.forward(x_in, x_in.dtype())
+            .splitAxis(.dout, .{ .vh = self.num_v_heads, .vhd = self.head_v_dim });
+        const b = self.in_proj_b.forward(x_in, x_in.dtype()).rename(.{ .dout = .vh });
+        const a = self.in_proj_a.forward(x_in, x_in.dtype()).rename(.{ .dout = .vh });
+
+        const query = mixed_qkv
+            .slice(.mix, .{ .start = 0, .end = key_dim })
+            .splitAxis(.mix, .{ .kh = self.num_k_heads, .khd = self.head_k_dim });
+        const key = mixed_qkv
+            .slice(.mix, .{ .start = key_dim, .end = 2 * key_dim })
+            .splitAxis(.mix, .{ .kh = self.num_k_heads, .khd = self.head_k_dim });
+        const value = mixed_qkv
+            .slice(.mix, .{ .start = 2 * key_dim, .end = 2 * key_dim + value_dim })
+            .splitAxis(.mix, .{ .vh = self.num_v_heads, .vhd = self.head_v_dim });
+
+        const beta = b.sigmoid();
+        const aLog_type = self.aLog.dtype();
+        const g = self.aLog.broad(a.shape()).exp().mul(zml.nn.softplus(a.convert(aLog_type).add(self.dt_bias.convert(aLog_type).broad(a.shape())), .{})).negate();
+
+        const query_for_rule = b: {
+            if (self.qk_head_repetition == 1) break :b query;
+            break :b query.stutter1d(query.axis(.kh), self.qk_head_repetition);
+        };
+        const key_for_rule = b: {
+            if (self.qk_head_repetition == 1) break :b key;
+            break :b key.stutter1d(key.axis(.kh), self.qk_head_repetition);
+        };
+
+        const core_attn_out, const stacked = recurrentGatedDeltaRuleStacked(
+            query_for_rule,
+            key_for_rule,
+            value,
+            g,
+            beta,
+            cache.recurrentState(),
+            active_length,
+        );
+
+        const core_attn_out_normed = self.norm
+            .forward(
+                core_attn_out.rename(.{ .vhd = .d }),
+                z.rename(.{ .vhd = .d }),
+            )
+            .rename(.{ .d = .vhd });
+
+        const output = self.out_proj
+            .forward(core_attn_out_normed.merge(.{ .d = .{ .vh, .vhd } }), core_attn_out_normed.dtype())
+            .rename(.{ .dout = .d })
+            .withPartitioning(.model, .{ .d = .replicated });
+        return .{ output, stacked, conv_input };
+    }
 };
+
+/// Rolls the GatedDeltaNet cache forward to the accepted prefix of a
+/// speculative block. `stacked_states[j]` is the recurrent state after block
+/// position j, so accepting `valid` draft tokens keeps `stacked_states[valid]`;
+/// the conv state becomes the features of the last committed tokens.
+pub fn commitSpeculativeState(
+    cache: KvCache.GatedDeltaNetCache,
+    stacked_states: zml.Tensor,
+    conv_feats: zml.Tensor,
+    valid_draft_tokens: zml.Tensor,
+) KvCache.GatedDeltaNetCache {
+    const valid = valid_draft_tokens.convert(.i64);
+    const selected = stacked_states.slice(.s, .dyn(valid, 1)).squeeze(.s);
+    const new_recurrent = selected
+        .transpose(.{ .b, .layer, .vh, .khd, .vhd })
+        .convert(cache.recurrent_state.dtype())
+        .reuseBuffer(cache.recurrent_state);
+    const conv_start = valid.addConstant(1);
+    const new_conv = conv_feats
+        .slice(.s, .dyn(conv_start, cache.conv_state.dim(.s)))
+        .convert(cache.conv_state.dtype())
+        .reuseBuffer(cache.conv_state);
+    return .{
+        .conv_state = new_conv,
+        .recurrent_state = new_recurrent,
+        .layer_index = cache.layer_index,
+    };
+}
 
 pub const RmsNorm = struct {
     weight: zml.Tensor,

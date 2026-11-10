@@ -824,7 +824,7 @@ pub const QuantizedLinearQ8 = struct {
                 const zeros = zml.Tensor.scalar(0, x.dtype()).broad(zml.Shape.init(.{ .m = m_padded - m, .k = d }, x.dtype()));
                 break :blk2 zml.Tensor.concatenate(&.{ x_flat, zeros }, .m);
             };
-            break :blk q8Matvec(x_padded, self.quants, self.scales, self.block_n);
+            break :blk q8Matvec(x_padded, self.quants, self.scales, few_row_block_n);
         };
 
         const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
@@ -902,7 +902,7 @@ pub const QuantizedLinearQ4 = struct {
                 const zeros = zml.Tensor.scalar(0, x.dtype()).broad(zml.Shape.init(.{ .m = m_padded - m, .k = d }, x.dtype()));
                 break :blk2 zml.Tensor.concatenate(&.{ x_flat, zeros }, .m);
             };
-            break :blk q4Matvec(x_padded, self.qs, self.sc, self.mn, self.d, self.dmin, self.block_n);
+            break :blk q4Matvec(x_padded, self.qs, self.sc, self.mn, self.d, self.dmin, few_row_block_n);
         };
 
         const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
@@ -982,7 +982,7 @@ pub const QuantizedLinearQ5 = struct {
                 const zeros = zml.Tensor.scalar(0, x.dtype()).broad(zml.Shape.init(.{ .m = m_padded - m, .k = d }, x.dtype()));
                 break :blk2 zml.Tensor.concatenate(&.{ x_flat, zeros }, .m);
             };
-            break :blk q5Matvec(x_padded, self.qs, self.qh, self.sc, self.mn, self.d, self.dmin, self.block_n);
+            break :blk q5Matvec(x_padded, self.qs, self.qh, self.sc, self.mn, self.d, self.dmin, few_row_block_n);
         };
 
         const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
@@ -1068,7 +1068,7 @@ pub const QuantizedLinearQ6 = struct {
                 const zeros = zml.Tensor.scalar(0, x.dtype()).broad(zml.Shape.init(.{ .m = m_padded - m, .k = d }, x.dtype()));
                 break :blk2 zml.Tensor.concatenate(&.{ x_flat, zeros }, .m);
             };
-            break :blk q6Matvec(x_padded, self.ql0, self.ql1, self.qh, self.sc1, self.sc2, self.sc3, self.sc4, self.d, self.block_n);
+            break :blk q6Matvec(x_padded, self.ql0, self.ql1, self.qh, self.sc1, self.sc2, self.sc3, self.sc4, self.d, few_row_block_n);
         };
 
         const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
@@ -1144,7 +1144,7 @@ pub const QuantizedLinearIq4Xs = struct {
                 const zeros = zml.Tensor.scalar(0, x.dtype()).broad(zml.Shape.init(.{ .m = m_padded - m, .k = d }, x.dtype()));
                 break :blk2 zml.Tensor.concatenate(&.{ x_flat, zeros }, .m);
             };
-            break :blk iq4Matvec(x_padded, self.qs, self.scl, self.sch, self.d, self.block_n);
+            break :blk iq4Matvec(x_padded, self.qs, self.scl, self.sch, self.d, few_row_block_n);
         };
 
         const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
@@ -1216,7 +1216,7 @@ pub const QuantizedLinearIq4Nl = struct {
                 const zeros = zml.Tensor.scalar(0, x.dtype()).broad(zml.Shape.init(.{ .m = m_padded - m, .k = d }, x.dtype()));
                 break :blk2 zml.Tensor.concatenate(&.{ x_flat, zeros }, .m);
             };
-            break :blk iq4nlMatvec(x_padded, self.qs, self.d, self.block_n);
+            break :blk iq4nlMatvec(x_padded, self.qs, self.d, few_row_block_n);
         };
 
         const out_flat = if (out_padded.dim(.m) == m) out_padded else out_padded.slice(.m, .{ .start = 0, .end = m });
@@ -1423,6 +1423,13 @@ fn iq4nlGraphDequant(qs: zml.Tensor, d: zml.Tensor, n: i64, k: i64) zml.Tensor {
     const w = zml.Tensor.concatenate(&.{ w_lo, w_hi }, -1);
     return w.reshape(zml.Shape.init(.{ .n = n, .k = k }, .f32)).convert(.bf16);
 }
+
+/// Column block for the few-row (verification) dot kernels. Each program
+/// dequantizes a `[block_n, 256]` weight tile and feeds it to `tl.dot`, so a
+/// narrow block keeps the tile and the dot operands in registers. At 64 the
+/// 8-row verification path was 25-30% slower; 32 was in between and 8 lost
+/// coalescing.
+const few_row_block_n: i64 = 16;
 
 fn q8Matvec(x: zml.Tensor, quants: zml.Tensor, scales: zml.Tensor, block_n: i64) zml.Tensor {
     const m = x.dim(.m);

@@ -257,13 +257,13 @@ pub const DecoderLayer = struct {
                 null,
                 .d,
             ),
-            .attn_conv_base = store.createTensor("self_attn.attn_conv_base", .{ .d, .kernel, .side }, .model, .{ .d = .replicated, .kernel = .replicated, .side = .replicated }),
+            .attn_conv_base = store.createTensor("self_attn.attn_conv_base", .{ .side, .kernel, .d }, .model, .{ .side = .replicated, .kernel = .replicated, .d = .replicated }),
             .ffn_conv_proj = .init(
                 store.createTensor("ffn_conv_proj.weight", .{ .dout, .d }, .model, .{ .dout = .model, .d = .replicated }),
                 null,
                 .d,
             ),
-            .ffn_conv_base = store.createTensor("ffn_conv_base", .{ .d, .kernel, .side }, .model, .{ .d = .replicated, .kernel = .replicated, .side = .replicated }),
+            .ffn_conv_base = store.createTensor("ffn_conv_base", .{ .side, .kernel, .d }, .model, .{ .side = .replicated, .kernel = .replicated, .d = .replicated }),
             .conv_kernel_size = @intCast(config.conv_kernel_size),
             .conv_group_size = @intCast(config.conv_group_size),
         };
@@ -497,7 +497,8 @@ fn conv(
         .broad(zml.Shape.init(.{ .s = s, .groups = groups, .within = group_size, .kernel = kernel_size }, coeff.dtype()))
         .reshape(zml.Shape.init(.{ .s = s, .d = d, .kernel = kernel_size }, coeff.dtype()));
 
-    const base = base_.slice(.side, .{ .start = side, .end = side + 1 }).squeeze(.side);
+    // GGUF stores the base kernel as [side, kernel, d] (d fastest).
+    const base = base_.slice(.side, .{ .start = side, .end = side + 1 }).squeeze(.side).transpose(.{ .d, .kernel });
     const weight = coeff_exp.add(base.reshape(zml.Shape.init(.{ .one = 1, .d = d, .kernel = kernel_size }, base.dtype())).broad(coeff_exp.shape()));
 
     var result: zml.Tensor = undefined;
@@ -537,8 +538,10 @@ pub fn selectorLattice(
     const unary = top.values;
 
     const succ = selector_successor.gather(.{ .voc = cand }, .{});
-    const anchor_b = anchor.convert(.i32).broad(zml.Shape.init(.{ .s = 1, .cand = top_k }, .i32));
-    const prev_cand = cand.slice(.s, .{ .start = 0, .end = s - 1 });
+    // Row 0 is the anchor slot and is not a proposal. Row 1's predecessor is
+    // the anchor token itself; row i >= 2 conditions on row i-1's candidates.
+    const anchor_b = anchor.convert(.i32).broad(zml.Shape.init(.{ .s = 2, .cand = top_k }, .i32));
+    const prev_cand = cand.slice(.s, .{ .start = 1, .end = s - 1 });
     const pred_ids = zml.Tensor.concatenate(&.{ anchor_b, prev_cand }, .s);
     const pred = selector_predecessor.gather(.{ .voc = pred_ids }, .{});
 

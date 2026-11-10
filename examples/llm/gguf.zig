@@ -977,10 +977,6 @@ fn mapDflashName(allocator: std.mem.Allocator, name: []const u8) !?[]const u8 {
 
 fn dflashDims(tensor: TensorInfo, buffer: *[4]i64) ?[]const i64 {
     if (tensor.dims.len > buffer.len) return null;
-    if (std.mem.endsWith(u8, tensor.name, "_conv_base")) {
-        for (0..tensor.dims.len) |i| buffer[i] = @intCast(tensor.dims[i]);
-        return buffer[0..tensor.dims.len];
-    }
     for (0..tensor.dims.len) |i| {
         buffer[i] = @intCast(tensor.dims[tensor.dims.len - 1 - i]);
     }

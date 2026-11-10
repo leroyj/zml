@@ -283,6 +283,10 @@ pub fn main(init: std.process.Init) !void {
     try generated.appendSlice(allocator, chat_tokens.items[0..prompt_len]);
     try generated.append(allocator, last_token);
 
+    const eos_token: u32 = if (target_ctx.getInt("tokenizer.ggml.eos_token_id")) |id| @intCast(id) else |_| im_end;
+    const stop_tokens = [_]u32{ eos_token, im_end, target_model.special_tokens.end_of_text_token_id };
+    var finished = std.mem.indexOfScalar(u32, &stop_tokens, last_token) != null;
+
     var start: u32 = prompt_len;
     var context_len: u32 = prompt_len;
     var draft_cache_index: u32 = 0;
@@ -294,7 +298,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(block_tokens);
     var pos0_hits: usize = 0;
 
-    while (start < args.max_seq_len and step < 64) : (step += 1) {
+    while (!finished and start < args.max_seq_len and step < 64) : (step += 1) {
         @memset(block_tokens, mask_token_id);
         block_tokens[0] = last_token;
 
@@ -437,12 +441,18 @@ pub fn main(init: std.process.Init) !void {
         const step_start = start;
         for (0..valid) |i| {
             if (start >= args.max_seq_len) break;
-            try generated.append(allocator, block_tokens[i + 1]);
+            const token = block_tokens[i + 1];
+            try generated.append(allocator, token);
             start += 1;
+            if (std.mem.indexOfScalar(u32, &stop_tokens, token) != null) {
+                finished = true;
+                break;
+            }
         }
-        if (start < args.max_seq_len) {
+        if (!finished and start < args.max_seq_len) {
             try generated.append(allocator, correction);
             start += 1;
+            if (std.mem.indexOfScalar(u32, &stop_tokens, correction) != null) finished = true;
         }
         last_token = correction;
 
@@ -470,6 +480,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(out_buf);
     var stdout = std.Io.File.stdout().writerStreaming(io, &.{});
     for (generated.items[prompt_len..]) |token| {
+        if (std.mem.indexOfScalar(u32, &stop_tokens, token) != null) break;
         try stdout.interface.writeAll(try decoder.feedOne(token, out_buf));
     }
     try stdout.interface.writeAll(try decoder.finalize(out_buf));

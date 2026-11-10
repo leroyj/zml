@@ -372,6 +372,14 @@ pub const Sampler = struct {
         const x = self.norm.forward(hidden);
         return self.lm_head.forward(x.withPartialTags(.{.d}), x.dtype()).rename(.{ .dout = .voc });
     }
+
+    /// LM head only, for a hidden state that its own model already normalised.
+    /// The DFlash drafter ends in its own `output_norm`, and the reference
+    /// feeds that straight to the target's output projection; applying the
+    /// target norm as well would normalise twice.
+    pub fn logitsFromNormed(self: Sampler, hidden: zml.Tensor) zml.Tensor {
+        return self.lm_head.forward(hidden.withPartialTags(.{.d}), hidden.dtype()).rename(.{ .dout = .voc });
+    }
 };
 
 pub const EmbedTokens = struct {

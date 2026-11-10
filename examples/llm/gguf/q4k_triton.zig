@@ -30,6 +30,27 @@ pub const Q4KMatvec = tri.Kernel(Config, .{
     .run = runMatvec,
 });
 
+/// Few-row variant: each program owns one block of output columns and keeps one
+/// accumulator per row in registers. The weight block is dequantized once and
+/// reused by every row, so a verification block pays the dequant cost once and
+/// needs no `tl.dot` operand layout.
+///
+/// Measured against `Q4KMatvec` with `examples/llm/q4k_bench`: both reach the
+/// same 58 GB/s at `block_n = 16`, so the model uses the dot. Kept because it
+/// is the natural alternative to re-measure against.
+pub fn Q4KMatvecRows(comptime rows: i64) type {
+    return tri.Kernel(Config, .{
+        .name = "q4k_matvec_rows",
+        .inputs = &.{ "x_ptr", "qs_ptr", "sc_ptr", "mn_ptr", "d_ptr", "dmin_ptr" },
+        .outputs = &.{"out"},
+        .run = struct {
+            fn run(b: *Builder, cfg: Config) tri.FinishError!void {
+                return runMatvecRows(b, cfg, rows);
+            }
+        }.run,
+    });
+}
+
 const Args = struct {
     x_ptr: Value,
     qs_ptr: Value,
@@ -184,4 +205,41 @@ fn runMatvec(b: *Builder, cfg: Config) tri.FinishError!void {
     const out_rows = b.broadcastTo(offs_m.expandDims(1).to(.i64).mul(cfg.n), &.{ cfg.block_m, block_n });
     const out_cols = b.broadcastTo(offs_n.expandDims(0).to(.i64), &.{ cfg.block_m, block_n });
     b.store(a.out_ptr.addPtr(out_rows.add(out_cols)), loop.results[0].to(.bf16));
+}
+
+fn runMatvecRows(b: *Builder, cfg: Config, comptime rows: i64) tri.FinishError!void {
+    const a = try declare(b);
+    const pid_n = b.programId(.x);
+    const offs_n = pid_n.mul(cfg.block_n).add(b.arange(0, cfg.block_n, .i32));
+    const block_n = cfg.block_n;
+
+    var accs: [rows]Value = undefined;
+    inline for (0..rows) |r| accs[r] = b.zeros(&.{block_n}, .f32);
+
+    const num_k = @divExact(cfg.k, 256);
+    var loop = b.openFor(0, num_k, 1, accs);
+    {
+        const k_iter = loop.iv;
+
+        const block = loadBlock(b, a, cfg, offs_n, k_iter, block_n);
+        const dmin_off = offs_n.to(.i64).mul(cfg.stride_dmin_n).add(k_iter);
+        const dmin = b.load(a.dmin_ptr.addPtr(dmin_off));
+        const w = dequantQ4K(b, block[0], block[1], block[2], block[3], block[4], block[5], dmin, block_n, false);
+
+        inline for (0..rows) |r| {
+            const x_off = k_iter.mul(256)
+                .add(b.arange(0, 256, .i64))
+                .add(b.splat(@as(i64, @intCast(r)) * cfg.k, &.{256}));
+            const x_val = b.load(a.x_ptr.addPtr(x_off));
+            const x_bcast = b.broadcastTo(x_val.expandDims(0), &.{ block_n, 256 });
+            loop.carried[r] = loop.carried[r].add(b.sumOpts(w.mul(x_bcast.to(.f32)), .{ .axis = 1 }));
+        }
+        loop.yield(loop.carried);
+    }
+
+    // `out` is [rows, n] row-major: one contiguous store per row.
+    inline for (0..rows) |r| {
+        const out_off = offs_n.to(.i64).add(b.splat(@as(i64, @intCast(r)) * cfg.n, &.{block_n}));
+        b.store(a.out_ptr.addPtr(out_off), loop.results[r].to(.bf16));
+    }
 }

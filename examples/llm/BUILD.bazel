@@ -131,6 +131,14 @@ zig_binary(
 )
 
 zig_binary(
+    name = "q4k_bench",
+    srcs = ["q4k_bench.zig", "gguf/q4k_triton.zig"],
+    main = "q4k_bench.zig",
+    visibility = ["//visibility:public"],
+    deps = ["//zml"],
+)
+
+zig_binary(
     name = "dflash2_spec",
     srcs = glob(["**/*.zig"]),
     main = "dflash2_spec.zig",

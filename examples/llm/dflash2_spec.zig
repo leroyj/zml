@@ -18,6 +18,7 @@ const Args = struct {
     draft: []const u8,
     prompt: []const u8 = "What is the capital of France? Answer in one sentence.",
     max_seq_len: u32 = 64,
+    zero_context: bool = false,
 
     pub const help =
         \\Options:
@@ -291,6 +292,7 @@ pub fn main(init: std.process.Init) !void {
 
     var block_tokens = try allocator.alloc(u32, @intCast(block));
     defer allocator.free(block_tokens);
+    var pos0_hits: usize = 0;
 
     while (start < args.max_seq_len and step < 64) : (step += 1) {
         @memset(block_tokens, mask_token_id);
@@ -326,6 +328,15 @@ pub fn main(init: std.process.Init) !void {
         var anchor_buf = try zml.Buffer.scalar(io, platform, last_token, .u32);
         defer anchor_buf.deinit();
 
+        var zeroed_context: zml.Buffer = undefined;
+        if (args.zero_context) {
+            const bytes = try allocator.alloc(u8, context_hidden.shape().byteSize());
+            defer allocator.free(bytes);
+            @memset(bytes, 0);
+            zeroed_context = try zml.Buffer.fromBytes(io, platform, context_hidden.shape(), bytes);
+        }
+        defer if (args.zero_context) zeroed_context.deinit();
+
         const draft_exe_ = if (is_prefill_draft) &draft_prefill_exe else &draft_exe;
         var draft_args = try draft_exe_.args(allocator);
         defer draft_args.deinit(allocator);
@@ -334,7 +345,7 @@ pub fn main(init: std.process.Init) !void {
         draft_args.set(.{
             draft_buffers,
             target_buffers,
-            context_hidden,
+            if (args.zero_context) zeroed_context else context_hidden,
             noise_buf,
             pos_buf,
             draft_kv_buffers,
@@ -404,6 +415,8 @@ pub fn main(init: std.process.Init) !void {
         const correction = correction_slice.constItems(u32)[0];
         valid_buf.deinit();
         correction_buf.deinit();
+        const draft_pos0: u32 = @as(u32, @intFromFloat(lattice[0]));
+        if (draft_pos0 == correction) pos0_hits += 1;
 
         // Roll the recurrent/conv state forward to the accepted prefix.
         var valid_scalar_buf = try zml.Buffer.scalar(io, platform, valid, .u32);
@@ -443,6 +456,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (owns_context) context_hidden.deinit();
 
+    log.info("draft position-0 accuracy: {d}/{d} = {d:.1}%", .{ pos0_hits, step, 100.0 * @as(f64, @floatFromInt(pos0_hits)) / @as(f64, @floatFromInt(@max(step, 1))) });
     const elapsed = decode_start.untilNow(io, .awake);
     const seconds = @as(f64, @floatFromInt(elapsed.nanoseconds)) / std.time.ns_per_s;
     const decoded = start - prompt_len;

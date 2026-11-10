@@ -93,6 +93,7 @@ fn dequantQ6K(
     sc4: Value,
     d: Value,
     block_n: i64,
+    comptime bf16_out: bool,
 ) Value {
     const shape = [_]i64{ block_n, 2, 32 };
     const ql0_3 = b.reshape(ql0, &shape).to(.i32);
@@ -119,7 +120,9 @@ fn dequantQ6K(
     const w24 = b.join(w2, w4);
     const stacked = b.join(w13, w24);
     const w = b.reshape(stacked, &.{ block_n, 256 });
-    return w.mul(d.to(.f32).expandDims(1));
+    const scaled = w.mul(d.to(.f32).expandDims(1));
+    // Round to the dot operand type before the reshape moves the tile.
+    return if (bf16_out) scaled.to(.bf16) else scaled;
 }
 
 /// Maps the kernel's `[half, l, q]` element order back to the GGML `[half, q, l]`
@@ -195,7 +198,7 @@ fn runMatvec1(b: *Builder, cfg: Config) tri.FinishError!void {
         const x_bcast = b.broadcastTo(x_val.expandDims(0), &.{ block_n, 256 });
 
         const block = loadBlock(b, a, cfg, offs_n, k_iter, block_n);
-        const w = dequantQ6K(b, block.ql0, block.ql1, block.qh, block.sc1, block.sc2, block.sc3, block.sc4, block.d, block_n);
+        const w = dequantQ6K(b, block.ql0, block.ql1, block.qh, block.sc1, block.sc2, block.sc3, block.sc4, block.d, block_n, false);
 
         const prod = w.mul(x_bcast.to(.f32));
         const new_acc = acc_.add(b.sumOpts(prod, .{ .axis = 1 }));
@@ -228,7 +231,7 @@ fn runMatvec(b: *Builder, cfg: Config) tri.FinishError!void {
         const x_val = b.load(a.x_ptr.addPtr(x_rows.add(x_cols)));
 
         const block = loadBlock(b, a, cfg, offs_n, k_iter, block_n);
-        const w = dequantQ6K(b, block.ql0, block.ql1, block.qh, block.sc1, block.sc2, block.sc3, block.sc4, block.d, block_n).to(.bf16);
+        const w = dequantQ6K(b, block.ql0, block.ql1, block.qh, block.sc1, block.sc2, block.sc3, block.sc4, block.d, block_n, true);
         const w_t = b.trans(w, &.{ 1, 0 });
 
         const new_acc = b.dot(x_val, w_t, acc_);

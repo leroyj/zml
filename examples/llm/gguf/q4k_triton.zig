@@ -72,6 +72,7 @@ fn dequantQ4K(
     d: Value,
     dmin: Value,
     block_n: i64,
+    comptime bf16_out: bool,
 ) Value {
     const qs3 = b.reshape(qs, &.{ block_n, 4, 32 }).to(.i32);
     const lo = qs3.bitAnd(b.splat(@as(i32, 0x0F), &.{ block_n, 4, 32 })).to(.f32);
@@ -86,7 +87,9 @@ fn dequantQ4K(
 
     const w_lo = d_f.mul(sc_lo_f).mul(lo).sub(dmin_f.mul(mn_lo_f));
     const w_hi = d_f.mul(sc_hi_f).mul(hi).sub(dmin_f.mul(mn_hi_f));
-    const w = b.catOpts(w_lo, w_hi, .{ .dim = 2 });
+    // Round to the dot operand type before the concat so the interleave and the
+    // reshape move half as many bytes.
+    const w = if (bf16_out) b.catOpts(w_lo.to(.bf16), w_hi.to(.bf16), .{ .dim = 2 }) else b.catOpts(w_lo, w_hi, .{ .dim = 2 });
     return b.reshape(w, &.{ block_n, 256 });
 }
 
@@ -137,7 +140,7 @@ fn runMatvec1(b: *Builder, cfg: Config) tri.FinishError!void {
         const block = loadBlock(b, a, cfg, offs_n, k_iter, block_n);
         const dmin_off = offs_n.to(.i64).mul(cfg.stride_dmin_n).add(k_iter);
         const dmin = b.load(a.dmin_ptr.addPtr(dmin_off));
-        const w = dequantQ4K(b, block[0], block[1], block[2], block[3], block[4], block[5], dmin, block_n);
+        const w = dequantQ4K(b, block[0], block[1], block[2], block[3], block[4], block[5], dmin, block_n, false);
 
         const prod = w.mul(x_bcast.to(.f32));
         const new_acc = acc_.add(b.sumOpts(prod, .{ .axis = 1 }));
@@ -171,7 +174,7 @@ fn runMatvec(b: *Builder, cfg: Config) tri.FinishError!void {
         const block = loadBlock(b, a, cfg, offs_n, k_iter, block_n);
         const dmin_off = offs_n.to(.i64).mul(cfg.stride_dmin_n).add(k_iter);
         const dmin = b.load(a.dmin_ptr.addPtr(dmin_off));
-        const w = dequantQ4K(b, block[0], block[1], block[2], block[3], block[4], block[5], dmin, block_n).to(.bf16);
+        const w = dequantQ4K(b, block[0], block[1], block[2], block[3], block[4], block[5], dmin, block_n, true);
         const w_t = b.trans(w, &.{ 1, 0 });
 
         const new_acc = b.dot(x_val, w_t, acc_);

@@ -1427,8 +1427,10 @@ fn iq4nlGraphDequant(qs: zml.Tensor, d: zml.Tensor, n: i64, k: i64) zml.Tensor {
 /// Column block for the few-row (verification) dot kernels. Each program
 /// dequantizes a `[block_n, 256]` weight tile and feeds it to `tl.dot`, so a
 /// narrow block keeps the tile and the dot operands in registers. At 64 the
-/// 8-row verification path was 25-30% slower; 32 was in between and 8 lost
-/// coalescing.
+/// 8-row verification path was 25-30% slower; 8 lost coalescing.
+///
+/// It must divide every output width in the model: the linear-attention
+/// projections are 48 wide, so 16 works and 32 silently drops columns.
 const few_row_block_n: i64 = 16;
 
 fn q8Matvec(x: zml.Tensor, quants: zml.Tensor, scales: zml.Tensor, block_n: i64) zml.Tensor {

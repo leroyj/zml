@@ -69,6 +69,7 @@ fn dequantIq4Xs(
     d: Value,
     lut: Value,
     block_n: i64,
+    comptime bf16_out: bool,
 ) Value {
     const shape = [_]i64{ block_n, 8, 16 };
     const qs3 = b.reshape(qs, &shape).to(.i32);
@@ -97,7 +98,9 @@ fn dequantIq4Xs(
 
     const w_lo = val_lo.to(.f32).mul(dl.expandDims(2));
     const w_hi = val_hi.to(.f32).mul(dl.expandDims(2));
-    const w = b.catOpts(w_lo, w_hi, .{ .dim = 2 });
+    // Round to the dot operand type before the concat so the interleave and the
+    // reshape move half as many bytes.
+    const w = if (bf16_out) b.catOpts(w_lo.to(.bf16), w_hi.to(.bf16), .{ .dim = 2 }) else b.catOpts(w_lo, w_hi, .{ .dim = 2 });
     return b.reshape(w, &.{ block_n, 256 });
 }
 
@@ -145,7 +148,7 @@ fn runMatvec1(b: *Builder, cfg: Config) tri.FinishError!void {
         const x_bcast = b.broadcastTo(x_val.expandDims(0), &.{ block_n, 256 });
 
         const block = loadBlock(b, a, cfg, offs_n, k_iter, block_n);
-        const w = dequantIq4Xs(b, block[0], block[1], block[2], block[3], block[4], block_n);
+        const w = dequantIq4Xs(b, block[0], block[1], block[2], block[3], block[4], block_n, false);
 
         const prod = w.mul(x_bcast.to(.f32));
         const new_acc = acc_.add(b.sumOpts(prod, .{ .axis = 1 }));
@@ -177,7 +180,7 @@ fn runMatvec(b: *Builder, cfg: Config) tri.FinishError!void {
         const x_val = b.load(a.x_ptr.addPtr(x_rows.add(x_cols)));
 
         const block = loadBlock(b, a, cfg, offs_n, k_iter, block_n);
-        const w = dequantIq4Xs(b, block[0], block[1], block[2], block[3], block[4], block_n).to(.bf16);
+        const w = dequantIq4Xs(b, block[0], block[1], block[2], block[3], block[4], block_n, true);
         const w_t = b.trans(w, &.{ 1, 0 });
 
         const new_acc = b.dot(x_val, w_t, acc_);
